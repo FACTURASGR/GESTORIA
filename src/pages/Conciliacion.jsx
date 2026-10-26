@@ -1,10 +1,11 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import * as XLSX from 'xlsx'
 import { supabase } from '../lib/supabase'
 import {
-  detectFileType, parseMayor, parseMov, parseOperaciones, parseRendiciones, buildMatchesConLotes,
-  formatDate, formatMonto, parseDate,
+  detectFileType, parseMayor, parseMov, parseOperaciones, parseRendiciones,
+  conciliarTH, recalcularMov, armarLotes,
+  formatDate, formatMonto, parseDate, isoDate,
 } from '../lib/conciliacion'
 
 const EMPRESAS = ['MOVILIS', 'KIARA', 'CIARA', 'PEARA', 'INV4', 'SALRA']
@@ -147,11 +148,13 @@ export function buildPreview(slot, wb, ctx = {}) {
   }
 
   if (slot === 2) {
-    const items = Object.values(parseOperaciones(wb))
+    const items = parseOperaciones(wb)
     const con = items.filter(o => o.minuta), sin = items.filter(o => !o.minuta)
-    const epagos = sin.filter(o => /epagos/i.test(o.motivoPago)).length
+    const epagos   = sin.filter(o => /epagos/i.test(o.motivoPago)).length
+    const ambiguos = sin.filter(o => o.minutaEstado === 'ambigua').length
+    const otros    = sin.length - epagos - ambiguos
     if (!items.length) avisos.push({ tone: 'bad', text: 'No encontré operaciones de pago. ¿Es el reporte correcto?' })
-    if (sin.length) avisos.push({ tone: 'warn', text: `${sin.length} pago(s) sin número de minuta reconocible en "Motivo pago"` + (epagos ? ` (${epagos} son AUTORIZACION EPAGOS; ${sin.length - epagos} con texto libre sin número: habrá que asignarles el lote a mano).` : '.') })
+    if (sin.length) avisos.push({ tone: 'warn', text: `${sin.length} pago(s) sin minuta identificable: ${epagos} EPAGOS, ${ambiguos} con varios números de 6 dígitos y ${otros} sin número. Esos hay que completarlos a mano después de conciliar.` })
     if (ctx.rendSet && ctx.opsMinutas) {
       const unicas = [...new Set(ctx.opsMinutas)]
       const hay = unicas.filter(m => ctx.rendSet.has(m)).length
@@ -383,10 +386,15 @@ export default function Conciliacion() {
   const [saving,       setSaving]       = useState(false)
   const [activeTab,    setActiveTab]    = useState(0)
   const [previewSlot,  setPreviewSlot]  = useState(null)
-  const [notice,        setNotice]       = useState(null)
+  const [notice,       setNotice]       = useState(null)
+  const cargadoRef = useRef(null)   // evita recargar desde Supabase la conciliación que acabamos de guardar
 
-  useEffect(() => { if (id) loadFromSupabase(id) }, [id])
+  useEffect(() => {
+    if (id && id !== cargadoRef.current) { cargadoRef.current = id; loadFromSupabase(id) }
+  }, [id])
 
+  // Reabre una conciliación guardada. Los totales de Mayor y Rendiciones por lote no se guardan:
+  // para verlos hay que volver a conciliar con los archivos.
   async function loadFromSupabase(cId) {
     setProcessing(true)
     const [{ data: concil }, { data: deps }, { data: pags }, { data: pends }] = await Promise.all([
@@ -399,12 +407,33 @@ export default function Conciliacion() {
       setEmpresa(concil.empresa)
       setPeriodoDesde(concil.periodo_desde || '')
       setPeriodoHasta(concil.periodo_hasta || '')
+      const depositos = (deps || []).map(d => ({
+        mayor: { referencia: d.op_ref, fecha: d.fecha_mayor, monto: d.monto_mayor, descripcion: d.desc_mayor },
+        th: { codRef: d.cod_ref_th, fecha: d.fecha_th, monto: d.monto_th, descripcion: d.desc_th },
+        dias: d.dias_diferencia, estado: d.estado,
+      }))
+      const pendCredits = (pends || []).filter(p => p.origen === 'th' && p.tipo_movimiento === 'CREDIT')
+        .map(p => ({ codRef: p.referencia, fecha: p.fecha, monto: p.monto, descripcion: p.descripcion, posibleDevolucion: !/dep[oó]sito/i.test(p.descripcion || '') }))
+      const pendOP = (pends || []).filter(p => p.origen === 'mayor')
+        .map(p => ({ item: { tipo: p.tipo_movimiento, fecha: p.fecha, monto: p.monto, descripcion: p.descripcion, referencia: p.referencia }, razon: p.motivo }))
+      const filas = (pags || []).map(p => ({
+        _dbId: p.id, nroOp: p.nro_operacion, nroPago: p.nro_pago_th, fecha: p.fecha_th, total: parseFloat(p.monto_th) || 0,
+        seccRPA: p.secc_rpa || '', tarjetahabiente: p.tarjetahabiente || '', tarjeta: p.tarjeta || '', motivoPago: p.motivo_pago || '',
+        minuta: p.minuta || '', minutaEstado: p.minuta ? 'ok' : 'manual', minutaCandidatos: [], loteManual: p.lote || '',
+      }))
+      const dbDif = (pags || []).map(p => (p.diferencia === null || p.diferencia === undefined) ? null : parseFloat(p.diferencia))
+      const mov = recalcularMov(filas, null).map((r, i) => ({
+        ...r, diferencia: dbDif[i],
+        estadoFila: (pags[i].estado === 'revisar') ? 'revisar' : r.estadoFila,
+        alerta: (pags[i].estado === 'revisar') ? 'Marcado para revisar al guardar' : r.alerta,
+      }))
       setResults({
-        depositos:   (deps  || []).map(d => ({ mayor: { referencia: d.op_ref, fecha: d.fecha_mayor, monto: d.monto_mayor, descripcion: d.desc_mayor }, th: { fecha: d.fecha_th, monto: d.monto_th, descripcion: d.desc_th }, dias: d.dias_diferencia, estado: d.estado })),
-        pagos:       (pags  || []).map(p => ({ _dbId: p.id, mayor: { referencia: p.rm_ref, fecha: p.fecha_mayor, monto: p.monto_mayor, descripcion: p.desc_mayor }, th: { fecha: p.fecha_th, monto: p.monto_th }, op: p.minuta ? { minuta: p.minuta, seccRPA: p.secc_rpa, tarjetahabiente: p.tarjetahabiente, motivoPago: p.motivo_pago } : null, diferencia: parseFloat(p.diferencia || 0), lote: p.lote || '', estado: p.estado })),
-        pendMayor:   (pends || []).filter(p => p.origen === 'mayor').map(p => ({ item: { tipo: p.tipo_movimiento, fecha: p.fecha, monto: p.monto, descripcion: p.descripcion, referencia: p.referencia }, razon: p.motivo })),
-        pendCredits: (pends || []).filter(p => p.origen === 'th' && p.tipo_movimiento === 'CREDIT').map(p => ({ codRef: p.referencia, fecha: p.fecha, monto: p.monto, descripcion: p.descripcion })),
-        pendDebits:  (pends || []).filter(p => p.origen === 'th' && p.tipo_movimiento === 'DEBIT').map(p => ({ codRef: p.referencia, fecha: p.fecha, monto: p.monto, descripcion: p.descripcion })),
+        depositos, pendCredits, pendOP,
+        creditos: [
+          ...depositos.map(d => ({ codRef: d.th.codRef, fecha: d.th.fecha, descripcion: d.th.descripcion, monto: d.th.monto, movimiento: d.mayor.referencia })),
+          ...pendCredits.map(c => ({ codRef: c.codRef, fecha: c.fecha, descripcion: c.descripcion, monto: c.monto, movimiento: 'OP A CONCILIAR' })),
+        ],
+        mov, lotes: armarLotes(mov, [], {}), mayorRM: [], rendMap: null, rendLotes: {}, mayorLineas: [], avisos: [], deBase: true,
       })
       setConcilId(cId)
     }
@@ -450,7 +479,7 @@ export default function Conciliacion() {
       try { rendSet = new Set(leerRendiciones(workbooks[3]).filter(r => !emp || r.sistema === emp).map(r => r.minuta)) } catch (e) { /* se informa en su propia previsualización */ }
     }
     if (workbooks[2]) {
-      try { opsMinutas = Object.values(parseOperaciones(workbooks[2])).map(o => o.minuta).filter(Boolean) } catch (e) { /* idem */ }
+      try { opsMinutas = parseOperaciones(workbooks[2]).map(o => o.minuta).filter(Boolean) } catch (e) { /* idem */ }
     }
     return [0, 1, 2, 3].map(s => workbooks[s] ? safePreview(s, workbooks[s], { empresa, rendSet, opsMinutas }) : null)
   }, [workbooks, empresa])
@@ -458,194 +487,151 @@ export default function Conciliacion() {
   async function procesar() {
     setProcessing(true)
     try {
-      const rendiciones = workbooks[3] ? parseRendiciones(workbooks[3], empresa) : {}
-      const res = buildMatchesConLotes(parseMayor(workbooks[0]), parseMov(workbooks[1]), parseOperaciones(workbooks[2]), rendiciones)
+      const rendMap = workbooks[3] ? parseRendiciones(workbooks[3], empresa) : null
+      const res = conciliarTH({
+        mayorItems: parseMayor(workbooks[0]),
+        movItems: parseMov(workbooks[1]),
+        operaciones: parseOperaciones(workbooks[2]),
+        rendMap, empresa,
+      })
       setResults(res)
       setActiveTab(0)
     } catch (err) { alert('Error: ' + err.message) }
     setProcessing(false)
   }
 
+  // Edición manual de un pago (minuta o lote): recalcula lote, diferencia, estado y el control por lote
+  function editarMov(idx, cambios) {
+    setResults(prev => {
+      const base = prev.mov.map((r, i) => i === idx ? { ...r, ...cambios } : r)
+      const mov = recalcularMov(base, prev.rendMap)
+      return { ...prev, mov, lotes: armarLotes(mov, prev.mayorRM, prev.rendLotes) }
+    })
+  }
+
+  // Si la conciliación ya está guardada, el cambio manual se guarda al salir del campo
+  async function persistirMov(r) {
+    if (!r || !r._dbId) return
+    const estado = r.estadoFila === 'ok' ? 'ok' : r.estadoFila === 'revisar' ? 'revisar' : 'sin_lote'
+    await supabase.from('pagos').update({
+      minuta: r.minuta || null, lote: r.lote || null, diferencia: r.diferencia ?? 0, estado,
+      updated_at: new Date().toISOString(),
+    }).eq('id', r._dbId)
+  }
+
   async function guardar() {
     if (!results || !empresa) return
     setSaving(true)
+    const ok = async q => { const { error } = await q; if (error) throw error }
     try {
       let cId = concilId
       if (!cId) {
-        const { data, error } = await supabase.from('conciliaciones').insert({ empresa, periodo_desde: periodoDesde || null, periodo_hasta: periodoHasta || null, estado: 'borrador' }).select('id').single()
+        const { data, error } = await supabase.from('conciliaciones').insert({
+          empresa, periodo_desde: periodoDesde || null, periodo_hasta: periodoHasta || null, estado: 'borrador',
+        }).select('id').single()
         if (error) throw error
         cId = data.id
         setConcilId(cId)
+        cargadoRef.current = cId
         navigate(`/conciliacion/${cId}`, { replace: true })
       }
-      await Promise.all([
-        supabase.from('depositos').delete().eq('conciliacion_id', cId),
-        supabase.from('pagos').delete().eq('conciliacion_id', cId),
-        supabase.from('pendientes').delete().eq('conciliacion_id', cId),
-      ])
+      await ok(supabase.from('depositos').delete().eq('conciliacion_id', cId))
+      await ok(supabase.from('pagos').delete().eq('conciliacion_id', cId))
+      await ok(supabase.from('pendientes').delete().eq('conciliacion_id', cId))
+
       if (results.depositos.length) {
-        await supabase.from('depositos').insert(results.depositos.map(d => ({
-          conciliacion_id: cId, op_ref: d.mayor.referencia, fecha_mayor: formatDate(d.mayor.fecha) || null,
-          monto_mayor: d.mayor.monto, desc_mayor: d.mayor.descripcion,
-          fecha_th: formatDate(d.th.fecha) || null, monto_th: d.th.monto, desc_th: d.th.descripcion,
+        await ok(supabase.from('depositos').insert(results.depositos.map(d => ({
+          conciliacion_id: cId, op_ref: d.mayor.referencia,
+          fecha_mayor: isoDate(d.mayor.fecha), monto_mayor: d.mayor.monto, desc_mayor: d.mayor.descripcion,
+          cod_ref_th: d.th.codRef || null, fecha_th: isoDate(d.th.fecha), monto_th: d.th.monto, desc_th: d.th.descripcion,
           estado: d.estado || 'conciliado', dias_diferencia: d.dias || 0,
-        })))
+        }))))
       }
-      if (results.pagos.length) {
-        const { data: pi } = await supabase.from('pagos').insert(results.pagos.map(p => ({
-          conciliacion_id: cId, rm_ref: p.mayor.referencia, fecha_mayor: formatDate(p.mayor.fecha) || null,
-          monto_mayor: p.mayor.monto, desc_mayor: p.mayor.descripcion,
-          fecha_th: formatDate(p.th.fecha) || null, monto_th: p.th.monto,
-          minuta: p.op?.minuta || null, secc_rpa: p.op?.seccRPA || null,
-          tarjetahabiente: p.op?.tarjetahabiente || null, motivo_pago: p.op?.motivoPago || null,
-          lote: p.lote || null, diferencia: p.diferencia || 0, estado: p.estado || 'sin_lote',
+
+      if (results.mov.length) {
+        const { data: ins, error } = await supabase.from('pagos').insert(results.mov.map(r => ({
+          conciliacion_id: cId, fecha_th: isoDate(r.fecha), monto_th: r.total,
+          nro_pago_th: r.nroPago || null, nro_operacion: r.nroOp != null ? String(r.nroOp) : null,
+          minuta: r.minuta || null, secc_rpa: r.seccRPA || null, tarjetahabiente: r.tarjetahabiente || null,
+          tarjeta: r.tarjeta || null, motivo_pago: r.motivoPago || null,
+          lote: r.lote || null, diferencia: r.diferencia ?? 0,
+          estado: r.estadoFila === 'ok' ? 'ok' : r.estadoFila === 'revisar' ? 'revisar' : 'sin_lote',
         }))).select('id')
-        if (pi) setResults(prev => ({ ...prev, pagos: prev.pagos.map((p, i) => ({ ...p, _dbId: pi[i]?.id })) }))
+        if (error) throw error
+        if (ins) setResults(prev => ({ ...prev, mov: prev.mov.map((r, i) => ({ ...r, _dbId: ins[i]?.id })) }))
       }
-      const pendAll = [
-        ...results.pendMayor.map(p => ({ conciliacion_id: cId, origen: 'mayor', tipo_movimiento: p.item.tipo, fecha: formatDate(p.item.fecha) || null, monto: p.item.monto, descripcion: p.item.descripcion, referencia: p.item.referencia, motivo: p.razon })),
-        ...results.pendCredits.map(p => ({ conciliacion_id: cId, origen: 'th', tipo_movimiento: 'CREDIT', fecha: formatDate(p.fecha) || null, monto: p.monto, descripcion: p.descripcion, referencia: p.codRef })),
-        ...results.pendDebits.map(p => ({ conciliacion_id: cId, origen: 'th', tipo_movimiento: 'DEBIT', fecha: formatDate(p.fecha) || null, monto: p.monto, descripcion: p.descripcion, referencia: p.codRef })),
+
+      const pend = [
+        ...results.pendOP.map(p => ({ conciliacion_id: cId, origen: 'mayor', tipo_movimiento: p.item.tipo, fecha: isoDate(p.item.fecha), monto: p.item.monto, descripcion: p.item.descripcion, referencia: p.item.referencia, motivo: p.razon })),
+        ...results.pendCredits.map(p => ({ conciliacion_id: cId, origen: 'th', tipo_movimiento: 'CREDIT', fecha: isoDate(p.fecha), monto: p.monto, descripcion: p.descripcion, referencia: p.codRef, motivo: p.posibleDevolucion ? 'Posible devolución' : 'OP a conciliar' })),
       ]
-      if (pendAll.length) await supabase.from('pendientes').insert(pendAll)
+      if (pend.length) await ok(supabase.from('pendientes').insert(pend))
       alert('✓ Guardado correctamente')
     } catch (err) { alert('Error al guardar: ' + err.message); console.error(err) }
     setSaving(false)
   }
 
-  async function updateLote(idx, value) {
-    const pago = results.pagos[idx]
-    const estado = value.trim() ? (Math.abs(pago.diferencia) > 50 ? 'revisar' : 'ok') : 'sin_lote'
-    setResults(prev => ({ ...prev, pagos: prev.pagos.map((p, i) => i === idx ? { ...p, lote: value, estado } : p) }))
-    if (pago._dbId) {
-      await supabase.from('pagos').update({ lote: value || null, estado, updated_at: new Date().toISOString() }).eq('id', pago._dbId)
-    }
-  }
-
   function exportExcel() {
     if (!results) return
-    const { depositos, pagos, pendMayor, pendCredits, pendDebits } = results
+    const { creditos, mov, lotes, pendCredits, pendOP } = results
     const wb = XLSX.utils.book_new()
+    // Las fechas del reporte vienen como texto (31/05/26): se pasan a fecha real, como el paso «Convertir XX en 20XX» del instructivo
+    const f = v => parseDate(v) || v
+    const hoja = aoa => {
+      const ws = XLSX.utils.aoa_to_sheet(aoa, { cellDates: true })
+      Object.keys(ws).forEach(k => { if (k[0] !== '!' && ws[k].t === 'd') ws[k].z = 'dd/mm/yyyy' })
+      return ws
+    }
 
-    // ── HOJA 1: DEB-CRED ─────────────────────────────────────
-    // Replica la hoja DEB-CRED del archivo de conciliación acumulada.
-    // Columna G = MOVIMIENTO: para CREDIT que matchearon con un OP se pone el número de OP.
-    // Para CREDIT sin match: "OP A CONCILIAR". Para DEBIT: vacío.
-    const debCredRows = [
-      ['Cod Referencia', 'Fecha Acreditación', 'Descripción', 'Tipo', 'Monto', 'Disponible', 'MOVIMIENTO (OP)'],
-      // CREDITs conciliados → columna MOVIMIENTO = número de OP del Mayor
-      ...depositos.map(r => [
-        r.th.codRef || '',
-        formatDate(r.th.fecha),
-        r.th.descripcion || '',
-        'CREDIT',
-        r.th.monto,
-        '',
-        r.mayor.referencia,   // ← acá va el OP-XXXXXX en la columna MOVIMIENTO
-      ]),
-      // DEBITs conciliados → columna MOVIMIENTO vacía
-      ...pagos.map(r => [
-        r.th.codRef || '',
-        formatDate(r.th.fecha),
-        r.th.descripcion || '',
-        'DEBIT',
-        r.th.monto,
-        '',
-        '',
-      ]),
-      // DEBITs sin match
-      ...pendDebits.map(r => [
-        r.codRef || '',
-        formatDate(r.fecha),
-        r.descripcion || '',
-        'DEBIT',
-        r.monto,
-        '',
-        '',
-      ]),
-      // CREDITs sin match → "OP A CONCILIAR"
-      ...pendCredits.map(r => [
-        r.codRef || '',
-        formatDate(r.fecha),
-        r.descripcion || '',
-        'CREDIT',
-        r.monto,
-        '',
-        'OP A CONCILIAR',
-      ]),
-    ]
-    const ws1 = XLSX.utils.aoa_to_sheet(debCredRows)
-    ws1['!cols'] = [{wch:16},{wch:14},{wch:60},{wch:8},{wch:18},{wch:16},{wch:18}]
-    XLSX.utils.book_append_sheet(wb, ws1, 'DEB-CRED')
+    // DEB-CRED: solo CREDIT, con la columna MOVIMIENTO (G) completa
+    const deb = hoja([
+      ['Cod referencia', 'Fecha acreditacion', 'Descripcion', 'Tipo', 'Monto', 'Disponible despues de movimiento', 'MOVIMIENTO'],
+      ...creditos.map(c => [c.codRef || '', f(c.fecha), c.descripcion, 'CREDIT', c.monto, c.disponible ?? '', c.movimiento]),
+    ])
+    deb['!cols'] = [{ wch: 16 }, { wch: 14 }, { wch: 70 }, { wch: 8 }, { wch: 16 }, { wch: 18 }, { wch: 16 }]
+    XLSX.utils.book_append_sheet(wb, deb, 'DEB-CRED')
 
-    // ── HOJA 2: MOV (Operaciones de Pago) ────────────────────
-    // Replica la hoja MOV. Columna P = LOTE asignado por el usuario.
-    const movRows = [
-      ['Nro Operación', 'Nro Pago', 'Fecha', 'Total', 'Secc. RPA', 'Tarjetahabiente',
-       'Estado', 'Motivo Pago', 'Minuta', 'Diferencia', 'LOTE'],
-      ...pagos.map(r => [
-        r.op?.nroOp   || '',
-        r.op?.nroPago || '',
-        formatDate(r.th.fecha),
-        r.th.monto,
-        r.op?.seccRPA          || '',
-        r.op?.tarjetahabiente  || '',
-        r.op?.estado           || '',
-        r.op?.motivoPago       || '',
-        r.op?.minuta           || '',
-        r.diferencia,
-        r.lote || '',           // ← columna LOTE (P) que se va completando desde CELER
-      ]),
-      ...pendDebits.map(r => [
-        '', r.pagoNum || '',
-        formatDate(r.fecha), r.monto,
-        '', '', '', '', '', '', '',
-      ]),
-    ]
-    const ws2 = XLSX.utils.aoa_to_sheet(movRows)
-    ws2['!cols'] = [{wch:14},{wch:12},{wch:12},{wch:16},{wch:28},{wch:30},{wch:12},{wch:55},{wch:12},{wch:14},{wch:12}]
-    XLSX.utils.book_append_sheet(wb, ws2, 'MOV')
+    // Mov: mismo orden de columnas que la hoja Mov de la conciliación (N Minuta · O Diferencias · P Lote)
+    const movHoja = hoja([
+      ['Nro. operacion', 'Nro de pago', 'Canal', 'Acreditacion', 'Nro cupon', 'Fecha', 'Total', 'Secc. RPA', 'Tarjetahabiente', 'Tarjeta', 'Estado', 'Motivo pago', 'Observaciones', 'Minuta', 'Diferencias', 'Lote', 'OBSERVACIONES'],
+      ...mov.map(r => [r.nroOp, r.nroPago, r.canal || '', r.acreditacion || '', r.nroCupon ?? '', f(r.fecha), r.total, r.seccRPA, r.tarjetahabiente, r.tarjeta, r.estado || '', r.motivoPago, r.observaciones || '',
+        r.minuta ? Number(r.minuta) : '', r.diferencia ?? '', r.lote ? (/^\d+$/.test(r.lote) ? Number(r.lote) : r.lote) : '', r.alerta || '']),
+    ])
+    movHoja['!cols'] = [{ wch: 14 }, { wch: 12 }, { wch: 10 }, { wch: 12 }, { wch: 10 }, { wch: 11 }, { wch: 14 }, { wch: 26 }, { wch: 26 }, { wch: 20 }, { wch: 11 }, { wch: 46 }, { wch: 14 }, { wch: 10 }, { wch: 12 }, { wch: 9 }, { wch: 60 }]
+    XLSX.utils.book_append_sheet(wb, movHoja, 'Mov')
 
-    // ── HOJA 3: MAYOR ─────────────────────────────────────────
-    // Replica las filas relevantes del Mayor con columna L completada:
-    //   OP → columna L = "OP-XXXXXX"
-    //   RM → columna L = número de lote (cuando esté asignado) o número TH
-    const mayorRows = [
-      ['Fecha', 'Conciliado', 'Comprobante', 'Pagos', 'Depósitos', 'Balance', '',
-       '', '', '', '', 'COL L (Ref / Lote)'],
-      ...depositos.map(r => [
-        formatDate(r.mayor.fecha), '', r.mayor.descripcion || '',
-        '', r.mayor.monto, '', '', '', '', '', '',
-        r.mayor.referencia,       // ← OP-XXXXXX en columna L
-      ]),
-      ...pagos.map(r => [
-        formatDate(r.mayor.fecha), '', r.mayor.descripcion || '',
-        r.mayor.monto, '', '', '', '', '', '', '',
-        r.lote || r.mayor.referencia || '',  // ← Lote si está asignado, sino ref TH
-      ]),
-      ...pendMayor.map(r => [
-        formatDate(r.item.fecha), '', r.item.descripcion || '',
-        r.item.tipo === 'RM' ? r.item.monto : '',
-        r.item.tipo === 'OP' ? r.item.monto : '',
-        '', '', '', '', '', '',
-        '⚠ SIN MATCH EN TH',
-      ]),
-    ]
-    const ws3 = XLSX.utils.aoa_to_sheet(mayorRows)
-    ws3['!cols'] = [{wch:14},{wch:14},{wch:65},{wch:18},{wch:18},{wch:18},{wch:4},{wch:4},{wch:4},{wch:4},{wch:4},{wch:20}]
-    XLSX.utils.book_append_sheet(wb, ws3, 'Mayor')
+    // Mayor: la hoja descargada de Autodealer + columna L (OP-xxxx para depósitos, N° de lote para RM). Las RC se ignoran.
+    if (workbooks[0]) {
+      const raw = XLSX.utils.sheet_to_json(workbooks[0].Sheets[workbooks[0].SheetNames[0]], { header: 1, raw: true, defval: null })
+      const filas = raw.map(r => [...r])
+      for (const it of results.mayorLineas || []) {
+        if (it.fila == null || !filas[it.fila] || !it.referencia) continue
+        while (filas[it.fila].length < 12) filas[it.fila].push(null)
+        filas[it.fila][11] = it.tipo === 'RM' && /^\d+$/.test(it.referencia) ? Number(it.referencia) : it.referencia
+      }
+      XLSX.utils.book_append_sheet(wb, hoja(filas), 'Mayor')
+    }
 
-    // ── HOJA 4: Pendientes ────────────────────────────────────
-    const pendRows = [
-      ['Origen', 'Tipo', 'Fecha', 'Monto', 'Descripción', 'Ref', 'Motivo'],
-      ...pendMayor.map(p => ['Mayor', p.item.tipo, formatDate(p.item.fecha), p.item.monto, p.item.descripcion, p.item.referencia, p.razon]),
-      ...pendCredits.map(p => ['TH', 'CREDIT', formatDate(p.fecha), p.monto, p.descripcion, p.codRef, 'OP a conciliar']),
-      ...pendDebits.map(p => ['TH', 'DEBIT', formatDate(p.fecha), p.monto, p.descripcion, p.codRef, '']),
-    ]
-    const ws4 = XLSX.utils.aoa_to_sheet(pendRows)
-    XLSX.utils.book_append_sheet(wb, ws4, 'Pendientes')
+    // Control por lote
+    const ctl = hoja([
+      ['Lote', 'Mayor (RM)', 'Rendiciones CRM', 'Pagos Mov', 'Cant. pagos', 'Dif. Mov - CRM', 'Dif. Mov - Mayor', 'Dif. CRM - Mayor', 'Estado'],
+      ...lotes.map(l => [Number(l.lote), l.mayor ?? '', l.crm ?? '', l.mov, l.movN, l.difMovCrm ?? '', l.difMovMayor ?? '', l.difCrmMayor ?? '',
+        { ok: 'Cierra', revisar: 'Revisar', sin_pagos: 'Sin pagos en este Mov', sin_mayor: 'Sin RM en el Mayor' }[l.estado]]),
+    ])
+    ctl['!cols'] = [{ wch: 9 }, { wch: 16 }, { wch: 16 }, { wch: 16 }, { wch: 11 }, { wch: 15 }, { wch: 16 }, { wch: 16 }, { wch: 24 }]
+    XLSX.utils.book_append_sheet(wb, ctl, 'Control por lote')
 
-    XLSX.writeFile(wb, `Conciliacion_${empresa}_${new Date().toISOString().slice(0,10)}.xlsx`)
+    // Pendientes / alertas
+    const pend = hoja([
+      ['Tipo', 'Fecha', 'Monto', 'Detalle', 'Observación'],
+      ...pendCredits.map(c => ['OP a conciliar (CREDIT sin OP)', f(c.fecha), c.monto, c.descripcion, c.posibleDevolucion ? 'Posible devolución' : '']),
+      ...pendOP.map(p => ['OP del Mayor sin CREDIT', f(p.item.fecha), p.item.monto, p.item.descripcion, p.razon]),
+      ...mov.filter(r => r.estadoFila !== 'ok').map(r => ['Pago a completar o revisar', f(r.fecha), r.total, r.motivoPago, r.alerta]),
+    ])
+    pend['!cols'] = [{ wch: 32 }, { wch: 12 }, { wch: 16 }, { wch: 70 }, { wch: 70 }]
+    XLSX.utils.book_append_sheet(wb, pend, 'Pendientes')
+
+    XLSX.writeFile(wb, `Conciliacion_${empresa}_${new Date().toISOString().slice(0, 10)}.xlsx`)
   }
 
   if (processing && id) return (
@@ -806,7 +792,7 @@ export default function Conciliacion() {
           <button
             onClick={procesar}
             disabled={!workbooks[0] || !workbooks[1] || !workbooks[2] || !empresa || processing}
-            style={{ ...btnGreen, opacity: (!workbooks.every(Boolean) || !empresa || processing) ? .4 : 1 }}
+            style={{ ...btnGreen, opacity: (!workbooks[0] || !workbooks[1] || !workbooks[2] || !empresa || processing) ? .4 : 1 }}
           >
             {processing ? '⏳ Procesando…' : '⚡ Conciliar'}
           </button>
@@ -829,53 +815,79 @@ export default function Conciliacion() {
           setActiveTab={setActiveTab}
           onGuardar={guardar}
           onExport={exportExcel}
-          onNueva={() => { setResults(null); setWorkbooks([null,null,null,null]); setFileNames(['','','','']); setConcilId(null); navigate('/nueva') }}
+          onNueva={() => { setResults(null); setWorkbooks([null, null, null, null]); setFileNames(['', '', '', '']); setConcilId(null); cargadoRef.current = null; navigate('/nueva') }}
           onEditar={() => setResults(null)}
           puedeEditar={!!(workbooks[0] && workbooks[1] && workbooks[2])}
-          onUpdateLote={updateLote}
+          onEditMov={editarMov}
+          onPersistMov={persistirMov}
         />
       )}
     </div>
   )
 }
 
-function ResultsSection({ results, empresa, concilId, saving, activeTab, setActiveTab, onGuardar, onExport, onNueva, onUpdateLote, onEditar, puedeEditar }) {
-  const { depositos, pagos, pendMayor, pendCredits, pendDebits } = results
-  const totDep   = depositos.reduce((s, r) => s + r.mayor.monto, 0)
-  const totPag   = pagos.reduce((s, r) => s + r.mayor.monto, 0)
-  const sinLote  = pagos.filter(p => !p.lote).length
-  const conDiff  = pagos.filter(p => Math.abs(p.diferencia) > 50).length
-  const pendTotal = pendMayor.length + pendCredits.length + pendDebits.length
+const ESTADO_FILA = {
+  ok:         { txt: '✓ Listo',    bg: 'var(--green-dim)', c: 'var(--green)' },
+  revisar:    { txt: 'Revisar',    bg: 'var(--red-dim)',   c: 'var(--red)' },
+  sin_lote:   { txt: 'Sin lote',   bg: 'var(--amber-dim)', c: 'var(--amber)' },
+  sin_minuta: { txt: 'Sin minuta', bg: 'var(--amber-dim)', c: 'var(--amber)' },
+}
+const ESTADO_LOTE = {
+  ok:        { txt: 'Cierra',                 bg: 'var(--green-dim)', c: 'var(--green)', tip: 'Mayor, Rendiciones y pagos de Mov coinciden (tolerancia $50)' },
+  revisar:   { txt: 'Revisar',                bg: 'var(--red-dim)',   c: 'var(--red)',   tip: 'Hay una diferencia mayor a $50 entre Mayor, Rendiciones y Mov' },
+  sin_pagos: { txt: 'Sin pagos en este Mov',  bg: 'var(--amber-dim)', c: 'var(--amber)', tip: 'Ningún pago de este Mov tiene este lote: pueden ser pagos de un período anterior' },
+  sin_mayor: { txt: 'Sin RM en el Mayor',     bg: 'var(--amber-dim)', c: 'var(--amber)', tip: 'Hay pagos con este lote pero no hay una línea RM en el Mayor del período' },
+}
+
+function ResultsSection({ results, empresa, concilId, saving, activeTab, setActiveTab, onGuardar, onExport, onNueva, onEditar, puedeEditar, onEditMov, onPersistMov }) {
+  const { depositos, pendCredits, pendOP, mov, lotes, mayorRM } = results
+  const totDep    = depositos.reduce((s, r) => s + r.mayor.monto, 0)
+  const totMov    = mov.reduce((s, r) => s + r.total, 0)
+  const conLote   = mov.filter(r => r.lote).length
+  const sinMinuta = mov.filter(r => r.estadoFila === 'sin_minuta').length
+  const sinLote   = mov.filter(r => r.estadoFila === 'sin_lote').length
+  const revisar   = mov.filter(r => r.estadoFila === 'revisar').length
+  const lotesRev  = lotes.filter(l => l.estado === 'revisar').length
+  const rmSinNum  = (mayorRM || []).filter(m => !m.referencia)
+  const pendTotal = pendCredits.length + pendOP.length + rmSinNum.length
 
   const kpis = [
-    { label: 'Depósitos conciliados',  value: depositos.length,  sub: `$ ${formatMonto(totDep)}`,  color: 'var(--green)' },
-    { label: 'Pagos conciliados',      value: pagos.length,      sub: `$ ${formatMonto(totPag)}`,  color: 'var(--green)' },
-    { label: 'Sin lote asignado',      value: sinLote,           sub: sinLote ? 'Completar con CELER' : 'Todos asignados', color: sinLote ? 'var(--amber)' : 'var(--green)' },
-    { label: 'Diferencias > $50',      value: conDiff,           sub: conDiff ? 'Revisar urgente' : 'Sin diferencias',    color: conDiff ? 'var(--red)' : 'var(--green)' },
-    { label: 'Pendientes',             value: pendTotal,         sub: pendCredits.length ? `${pendCredits.length} OP a conciliar` : 'Sin pendientes', color: pendTotal ? 'var(--amber)' : 'var(--green)' },
+    { label: 'Depósitos conciliados', value: depositos.length, sub: pendCredits.length ? `${pendCredits.length} OP a conciliar` : `$ ${formatMonto(totDep)}`, color: pendCredits.length ? 'var(--amber)' : 'var(--green)' },
+    { label: 'Pagos (Mov)',           value: mov.length,       sub: `$ ${formatMonto(totMov)}`, color: 'var(--green)' },
+    { label: 'Con lote asignado',     value: `${conLote}/${mov.length}`, sub: conLote === mov.length ? 'Todos asignados' : `${mov.length - conLote} sin lote`, color: conLote === mov.length ? 'var(--green)' : 'var(--amber)' },
+    { label: 'A completar a mano',    value: sinMinuta + sinLote, sub: `${sinMinuta} sin minuta · ${sinLote} sin lote`, color: (sinMinuta + sinLote) ? 'var(--amber)' : 'var(--green)' },
+    { label: 'A revisar',             value: revisar + lotesRev, sub: `${revisar} pagos · ${lotesRev} lotes con diferencia`, color: (revisar + lotesRev) ? 'var(--red)' : 'var(--green)' },
   ]
 
   const tabs = [
-    `💰 Depósitos (${depositos.length})`,
-    `📋 Pagos y Lotes (${pagos.length})`,
+    `💰 Depósitos (${depositos.length + pendCredits.length})`,
+    `📋 Pagos · Mov (${mov.length})`,
+    `🧮 Lotes (${lotes.length})`,
     `⚠ Pendientes (${pendTotal})`,
   ]
 
   return (
     <>
-      {/* ACCIONES */}
-      <div style={{ display: 'flex', gap: 10, marginBottom: 24, flexWrap: 'wrap', alignItems: 'center' }}>
+      <div style={{ display: 'flex', gap: 10, marginBottom: 20, flexWrap: 'wrap', alignItems: 'center' }}>
         <button onClick={onGuardar} disabled={saving} style={btnGreen}>
           {saving ? '⏳ Guardando…' : concilId ? '💾 Actualizar' : '💾 Guardar'}
         </button>
         <button onClick={onExport} style={btnOutline}>⬇ Descargar Excel</button>
         {puedeEditar && <button onClick={onEditar} style={btnOutline}>✎ Editar archivos</button>}
         <button onClick={onNueva} style={btnOutline}>↺ Nueva</button>
-        {concilId && <span style={{ fontSize: '.72rem', color: 'var(--txt2)' }}>Los lotes se guardan automáticamente</span>}
+        {concilId && <span style={{ fontSize: '.72rem', color: 'var(--txt2)' }}>Los cambios de minuta y lote se guardan al salir del campo</span>}
       </div>
 
-      {/* KPIs */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5,1fr)', gap: 12, marginBottom: 24 }}>
+      {(results.avisos || []).map((a, i) => (
+        <div key={i} style={{ background: TONOS.warn.bg, border: `1px solid ${TONOS.warn.b}`, color: TONOS.warn.c, borderRadius: 8, padding: '9px 12px', fontSize: '.76rem', marginBottom: 12 }}>⚠ {a}</div>
+      ))}
+      {results.deBase && (
+        <div style={{ background: TONOS.info.bg, border: `1px solid ${TONOS.info.b}`, color: TONOS.info.c, borderRadius: 8, padding: '9px 12px', fontSize: '.76rem', marginBottom: 12 }}>
+          Conciliación guardada. Los totales de Mayor y Rendiciones por lote no se guardan: para verlos, volvé a conciliar con los archivos.
+        </div>
+      )}
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5,1fr)', gap: 12, marginBottom: 22 }}>
         {kpis.map(k => (
           <div key={k.label} style={{ background: 'var(--surf)', borderRadius: 9, padding: '16px', border: '1px solid var(--bdr)', borderLeft: `3px solid ${k.color}` }}>
             <div style={{ fontSize: '.65rem', color: 'var(--txt2)', textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 6 }}>{k.label}</div>
@@ -885,126 +897,110 @@ function ResultsSection({ results, empresa, concilId, saving, activeTab, setActi
         ))}
       </div>
 
-      {/* TABS */}
-      <div style={{ display: 'flex', gap: 2, borderBottom: '1px solid var(--bdr)', marginBottom: 20 }}>
+      <div style={{ display: 'flex', gap: 2, borderBottom: '1px solid var(--bdr)', marginBottom: 18, flexWrap: 'wrap' }}>
         {tabs.map((label, i) => (
           <button key={i} onClick={() => setActiveTab(i)} style={{
-            padding: '9px 18px', background: 'none', border: 'none', cursor: 'pointer',
-            fontSize: '.8rem', fontWeight: 600,
+            padding: '9px 18px', background: 'none', border: 'none', cursor: 'pointer', fontSize: '.8rem', fontWeight: 600,
             color: activeTab === i ? 'var(--green)' : 'var(--txt2)',
-            borderBottom: `2px solid ${activeTab === i ? 'var(--green)' : 'transparent'}`,
-            marginBottom: -1,
+            borderBottom: `2px solid ${activeTab === i ? 'var(--green)' : 'transparent'}`, marginBottom: -1,
           }}>{label}</button>
         ))}
       </div>
 
-      {/* TAB 0: DEPÓSITOS */}
+      {/* DEPÓSITOS: OP del Mayor ↔ CREDIT de Movimientos → columna MOVIMIENTO de DEB-CRED */}
       {activeTab === 0 && (
         <>
           {pendCredits.length > 0 && (
-            <div style={{ background: 'var(--amber-dim)', border: '1px solid rgba(245,158,11,.3)', borderRadius: 8, padding: '12px 16px', marginBottom: 16, fontSize: '.78rem', color: 'var(--amber)' }}>
-              <strong>⚠ {pendCredits.length} OP a conciliar</strong> — CREDIT en TH sin OP en el Mayor. Registrarlos en celda B7 de la pestaña Conciliación.
+            <div style={{ background: 'var(--amber-dim)', border: '1px solid rgba(245,158,11,.3)', borderRadius: 8, padding: '12px 16px', marginBottom: 14, fontSize: '.78rem', color: 'var(--amber)' }}>
+              <strong>⚠ {pendCredits.length} CREDIT sin OP en el Mayor</strong> — quedan como «OP A CONCILIAR» en DEB-CRED (anotarlos en B7 de la pestaña Conciliación). Si no es un depósito, puede ser una devolución.
             </div>
           )}
           <TableBox>
             <thead><tr>
-              {['Ref. OP','Fecha Mayor','Monto Mayor','Fecha TH','Descripción TH','Monto TH','Días','Estado'].map(h => <th key={h} style={th}>{h}</th>)}
+              {['OP (Mayor)', 'Fecha Mayor', 'Monto Mayor', 'Fecha TH', 'Descripción TH (CREDIT)', 'Monto TH', 'Días', 'MOVIMIENTO'].map(h => <th key={h} style={th}>{h}</th>)}
             </tr></thead>
             <tbody>
               {depositos.map((r, i) => (
-                <tr key={i} style={{ borderBottom: '1px solid var(--bdr)' }}>
+                <tr key={i}>
                   <td style={td}><strong style={{ color: 'var(--green)' }}>{r.mayor.referencia}</strong></td>
                   <td style={td}>{formatDate(r.mayor.fecha)}</td>
                   <td style={{ ...td, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{formatMonto(r.mayor.monto)}</td>
                   <td style={td}>{formatDate(r.th.fecha)}</td>
-                  <td style={{ ...td, maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.th.descripcion}</td>
+                  <td style={{ ...td, maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={r.th.descripcion}>{r.th.descripcion}</td>
                   <td style={{ ...td, textAlign: 'right' }}>{formatMonto(r.th.monto)}</td>
                   <td style={{ ...td, textAlign: 'right', color: r.dias > 3 ? 'var(--amber)' : 'var(--green)', fontWeight: 600 }}>{r.dias}</td>
-                  <td style={td}><span style={pill('var(--green-dim)', 'var(--green)')}>Conciliado</span></td>
+                  <td style={td}><span style={pill('var(--green-dim)', 'var(--green)')}>{r.mayor.referencia}</span></td>
                 </tr>
               ))}
               {pendCredits.map((r, i) => (
-                <tr key={'c'+i} style={{ borderBottom: '1px solid var(--bdr)' }}>
+                <tr key={'c' + i}>
                   <td style={{ ...td, color: 'var(--txt2)' }}>—</td>
                   <td style={{ ...td, color: 'var(--txt2)' }}>—</td>
                   <td style={{ ...td, color: 'var(--txt2)', textAlign: 'right' }}>—</td>
                   <td style={td}>{formatDate(r.fecha)}</td>
-                  <td style={{ ...td, maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.descripcion}</td>
+                  <td style={{ ...td, maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={r.descripcion}>{r.descripcion}</td>
                   <td style={{ ...td, textAlign: 'right', color: 'var(--red)', fontWeight: 600 }}>{formatMonto(r.monto)}</td>
                   <td style={{ ...td, color: 'var(--txt2)' }}>—</td>
-                  <td style={td}><span style={pill('var(--amber-dim)', 'var(--amber)')}>OP a conciliar</span></td>
+                  <td style={td}><span style={pill('var(--amber-dim)', 'var(--amber)')}>{r.posibleDevolucion ? '¿Devolución?' : 'OP A CONCILIAR'}</span></td>
                 </tr>
               ))}
+              {!depositos.length && !pendCredits.length && (
+                <tr><td colSpan={8} style={{ ...td, textAlign: 'center', color: 'var(--txt2)', padding: 24 }}>No hay depósitos en este período</td></tr>
+              )}
             </tbody>
           </TableBox>
         </>
       )}
 
-      {/* TAB 1: PAGOS Y LOTES */}
-      {activeTab === 1 && (
+      {activeTab === 1 && <PagosTab mov={mov} hayCRM={!!results.rendMap} onEdit={onEditMov} onPersist={onPersistMov} />}
+
+      {/* LOTES: cada RM del Mayor es un lote */}
+      {activeTab === 2 && (
         <>
-          {sinLote > 0 && (
-            <div style={{ background: 'var(--amber-dim)', border: '1px solid rgba(245,158,11,.3)', borderRadius: 8, padding: '12px 16px', marginBottom: 16, fontSize: '.78rem', color: 'var(--amber)' }}>
-              <strong>ℹ {sinLote} pago{sinLote > 1 ? 's' : ''} sin lote.</strong> Completá la columna Lote con el número de rendición de CELER.
-              {!concilId && <strong> Guardá primero para que los lotes se auto-guarden.</strong>}
-            </div>
-          )}
+          <div style={{ background: TONOS.info.bg, border: `1px solid ${TONOS.info.b}`, color: 'var(--txt2)', borderRadius: 8, padding: '10px 14px', fontSize: '.74rem', marginBottom: 14 }}>
+            Cada línea <strong>RM</strong> del Mayor es un lote de rendición. La suma de los pagos de Mov con ese lote tiene que coincidir con el Mayor y con el total del lote en Rendiciones (se revisa toda diferencia mayor a $50).
+          </div>
           <TableBox>
             <thead><tr>
-              {['Fecha Mayor','RM Ref.','Monto Mayor','Minuta','Seccional','Tarjetahabiente','Fecha TH','Monto TH','Diferencia','Lote'].map(h => <th key={h} style={th}>{h}</th>)}
+              {['Lote', 'Mayor (RM)', 'Rendiciones CRM', 'Pagos Mov', 'Dif. Mov − CRM', 'Dif. Mov − Mayor', 'Estado'].map((h, i) => <th key={h} style={{ ...th, textAlign: i >= 1 && i <= 5 ? 'right' : 'left' }}>{h}</th>)}
             </tr></thead>
             <tbody>
-              {pagos.map((r, i) => (
-                <tr key={i} style={{ borderBottom: '1px solid var(--bdr)' }}>
-                  <td style={td}>{formatDate(r.mayor.fecha)}</td>
-                  <td style={td}>{r.mayor.referencia}</td>
-                  <td style={{ ...td, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{formatMonto(r.mayor.monto)}</td>
-                  <td style={td}><strong style={{ color: 'var(--green)' }}>{r.op?.minuta || '—'}</strong>{r.opAmbiguo && <span title="Había más de un pago posible (mismo monto, seccional y fecha) con minutas distintas: confirmá esta minuta" style={{ color: 'var(--amber)', marginLeft: 6, cursor: 'help' }}>⚠</span>}</td>
-                  <td style={{ ...td, fontSize: '.7rem', color: 'var(--txt2)' }}>{r.op?.seccRPA || ''}</td>
-                  <td style={{ ...td, fontSize: '.7rem', whiteSpace: 'nowrap', color: 'var(--txt2)' }}>{r.op?.tarjetahabiente || ''}</td>
-                  <td style={td}>{formatDate(r.th.fecha)}</td>
-                  <td style={{ ...td, textAlign: 'right' }}>{formatMonto(r.th.monto)}</td>
-                  <td style={{ ...td, textAlign: 'right', fontWeight: 600, color: Math.abs(r.diferencia) > 50 ? 'var(--red)' : Math.abs(r.diferencia) > 0 ? 'var(--amber)' : 'var(--green)' }}>
-                    {Math.abs(r.diferencia) < 0.01 ? '—' : formatMonto(r.diferencia)}
-                  </td>
-                  <td style={td}>
-                    <input
-                      value={r.lote}
-                      onChange={e => onUpdateLote(i, e.target.value)}
-                      placeholder="Lote"
-                      style={{
-                        width: 80, background: r.lote ? 'var(--green-dim)' : '#111',
-                        border: `1px solid ${r.lote ? 'var(--green)' : 'var(--amber)'}`,
-                        color: '#fff', borderRadius: 5, padding: '4px 7px',
-                        fontSize: '.75rem', fontWeight: 600, outline: 'none',
-                      }}
-                    />
-                  </td>
-                </tr>
-              ))}
+              {lotes.map(l => {
+                const e = ESTADO_LOTE[l.estado]
+                const dif = d => d === null ? '—' : (Math.abs(d) < 0.01 ? '0,00' : formatMonto(d))
+                const colorDif = d => d === null ? 'var(--txt3)' : Math.abs(d) > 50 ? 'var(--red)' : Math.abs(d) > 0.01 ? 'var(--amber)' : 'var(--green)'
+                return (
+                  <tr key={l.lote}>
+                    <td style={td}><strong>{l.lote}</strong></td>
+                    <td style={{ ...td, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{l.mayor === null ? '—' : formatMonto(l.mayor)}</td>
+                    <td style={{ ...td, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{l.crm === null ? '—' : formatMonto(l.crm)}</td>
+                    <td style={{ ...td, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{l.movN ? `${formatMonto(l.mov)} (${l.movN})` : '—'}</td>
+                    <td style={{ ...td, textAlign: 'right', fontWeight: 600, color: colorDif(l.difMovCrm) }}>{dif(l.difMovCrm)}</td>
+                    <td style={{ ...td, textAlign: 'right', fontWeight: 600, color: colorDif(l.difMovMayor) }}>{dif(l.difMovMayor)}</td>
+                    <td style={td}><span title={e.tip} style={{ ...pill(e.bg, e.c), cursor: 'help' }}>{e.txt}</span></td>
+                  </tr>
+                )
+              })}
+              {!lotes.length && <tr><td colSpan={7} style={{ ...td, textAlign: 'center', color: 'var(--txt2)', padding: 24 }}>Todavía no hay lotes para controlar: asigná lotes a los pagos o cargá el Mayor del período</td></tr>}
             </tbody>
           </TableBox>
         </>
       )}
 
-      {/* TAB 2: PENDIENTES */}
-      {activeTab === 2 && (
+      {/* PENDIENTES */}
+      {activeTab === 3 && (
         pendTotal === 0
-          ? <div style={{ textAlign: 'center', padding: '48px 20px', color: 'var(--txt2)' }}>
-              <div style={{ fontSize: '2rem', marginBottom: 10 }}>✅</div>
-              Sin pendientes — todo conciliado.
-            </div>
+          ? <div style={{ textAlign: 'center', padding: '48px 20px', color: 'var(--txt2)' }}><div style={{ fontSize: '2rem', marginBottom: 10 }}>✅</div>Sin pendientes de depósitos ni de Mayor.</div>
           : <>
-            {pendMayor.length > 0 && (
-              <Section label={`📌 En Mayor sin match en TH (${pendMayor.length})`}>
+            {pendOP.length > 0 && (
+              <Section label={`📌 OP del Mayor sin depósito en TH (${pendOP.length})`}>
                 <TableBox>
-                  <thead><tr>{['Tipo','Fecha','Descripción','Ref.','Monto','Motivo'].map(h => <th key={h} style={th}>{h}</th>)}</tr></thead>
-                  <tbody>{pendMayor.map((r, i) => (
-                    <tr key={i} style={{ borderBottom: '1px solid var(--bdr)' }}>
-                      <td style={td}><span style={pill('var(--amber-dim)', 'var(--amber)')}>{r.item.tipo}</span></td>
+                  <thead><tr>{['OP', 'Fecha', 'Descripción', 'Monto', 'Motivo'].map(h => <th key={h} style={th}>{h}</th>)}</tr></thead>
+                  <tbody>{pendOP.map((r, i) => (
+                    <tr key={i}>
+                      <td style={td}><strong>{r.item.referencia}</strong></td>
                       <td style={td}>{formatDate(r.item.fecha)}</td>
-                      <td style={{ ...td, maxWidth: 280 }}>{r.item.descripcion}</td>
-                      <td style={td}>{r.item.referencia}</td>
+                      <td style={{ ...td, maxWidth: 320 }}>{r.item.descripcion}</td>
                       <td style={{ ...td, textAlign: 'right', color: 'var(--amber)', fontWeight: 600 }}>{formatMonto(r.item.monto)}</td>
                       <td style={{ ...td, fontSize: '.72rem', color: 'var(--txt2)' }}>{r.razon}</td>
                     </tr>
@@ -1012,16 +1008,30 @@ function ResultsSection({ results, empresa, concilId, saving, activeTab, setActi
                 </TableBox>
               </Section>
             )}
-            {pendDebits.length > 0 && (
-              <Section label={`🔴 DEBIT en TH sin match en Mayor (${pendDebits.length})`}>
+            {rmSinNum.length > 0 && (
+              <Section label={`📌 Líneas RM del Mayor sin número de lote (${rmSinNum.length})`}>
                 <TableBox>
-                  <thead><tr>{['Cod Ref','Fecha','Descripción','Monto'].map(h => <th key={h} style={th}>{h}</th>)}</tr></thead>
-                  <tbody>{pendDebits.map((r, i) => (
-                    <tr key={i} style={{ borderBottom: '1px solid var(--bdr)' }}>
-                      <td style={td}>{r.codRef}</td>
+                  <thead><tr>{['Fecha', 'Descripción', 'Monto'].map(h => <th key={h} style={th}>{h}</th>)}</tr></thead>
+                  <tbody>{rmSinNum.map((r, i) => (
+                    <tr key={i}>
                       <td style={td}>{formatDate(r.fecha)}</td>
-                      <td style={{ ...td, maxWidth: 320 }}>{r.descripcion}</td>
+                      <td style={{ ...td, maxWidth: 420 }}>{r.descripcion}</td>
+                      <td style={{ ...td, textAlign: 'right', color: 'var(--amber)', fontWeight: 600 }}>{formatMonto(r.monto)}</td>
+                    </tr>
+                  ))}</tbody>
+                </TableBox>
+              </Section>
+            )}
+            {pendCredits.length > 0 && (
+              <Section label={`💳 CREDIT de TH sin OP en el Mayor (${pendCredits.length})`}>
+                <TableBox>
+                  <thead><tr>{['Fecha', 'Descripción', 'Monto', 'Observación'].map(h => <th key={h} style={th}>{h}</th>)}</tr></thead>
+                  <tbody>{pendCredits.map((r, i) => (
+                    <tr key={i}>
+                      <td style={td}>{formatDate(r.fecha)}</td>
+                      <td style={{ ...td, maxWidth: 420 }}>{r.descripcion}</td>
                       <td style={{ ...td, textAlign: 'right', color: 'var(--red)', fontWeight: 600 }}>{formatMonto(r.monto)}</td>
+                      <td style={{ ...td, fontSize: '.72rem', color: 'var(--txt2)' }}>{r.posibleDevolucion ? 'No parece un depósito: ¿devolución?' : 'OP a conciliar'}</td>
                     </tr>
                   ))}</tbody>
                 </TableBox>
@@ -1029,6 +1039,101 @@ function ResultsSection({ results, empresa, concilId, saving, activeTab, setActi
             )}
           </>
       )}
+    </>
+  )
+}
+
+// Pagos de "Operaciones de pago" (hoja Mov): minuta, lote, total y diferencia contra Rendiciones.
+// Los que no se pueden resolver solos se completan acá a mano.
+function PagosTab({ mov, hayCRM, onEdit, onPersist }) {
+  const [filtro, setFiltro] = useState('pendientes')
+  const sinMinuta = mov.filter(r => r.estadoFila === 'sin_minuta').length
+  const sinLote   = mov.filter(r => r.estadoFila === 'sin_lote').length
+  const revisar   = mov.filter(r => r.estadoFila === 'revisar').length
+  const necesitan = mov.map((r, i) => ({ r, i })).filter(({ r }) => r.estadoFila !== 'ok')
+  const filas = (filtro === 'pendientes' ? necesitan : mov.map((r, i) => ({ r, i })))
+
+  const inputBase = { borderRadius: 5, padding: '4px 7px', fontSize: '.75rem', fontWeight: 600, color: '#fff', outline: 'none', width: 84 }
+
+  return (
+    <>
+      {sinMinuta > 0 && (
+        <div style={{ background: 'var(--amber-dim)', border: '1px solid rgba(245,158,11,.35)', borderRadius: 8, padding: '12px 16px', marginBottom: 12, fontSize: '.78rem', color: 'var(--amber)' }}>
+          <strong>⚠ {sinMinuta} pago(s) sin minuta identificable.</strong> No tienen un número de 6 dígitos en «Motivo pago» (por ejemplo AUTORIZACION EPAGOS) o tienen varios. Cargá la minuta a mano en la columna Minuta, o escribí directamente el lote.
+        </div>
+      )}
+      {!hayCRM && (
+        <div style={{ background: TONOS.info.bg, border: `1px solid ${TONOS.info.b}`, borderRadius: 8, padding: '10px 14px', marginBottom: 12, fontSize: '.76rem', color: 'var(--txt2)' }}>
+          No cargaste el reporte de Rendiciones CRM: los lotes hay que escribirlos a mano. (Para asignarlos solos, usá «Editar archivos» y subilo.)
+        </div>
+      )}
+      {sinLote > 0 && hayCRM && (
+        <div style={{ background: 'var(--amber-dim)', border: '1px solid rgba(245,158,11,.35)', borderRadius: 8, padding: '10px 14px', marginBottom: 12, fontSize: '.76rem', color: 'var(--amber)' }}>
+          {sinLote} pago(s) tienen minuta pero esa minuta no figura en el reporte de Rendiciones. Revisá que el reporte cubra la fecha en que se rindieron, o asigná el lote a mano.
+        </div>
+      )}
+      {revisar > 0 && (
+        <div style={{ background: 'var(--red-dim)', border: '1px solid rgba(229,57,53,.35)', borderRadius: 8, padding: '10px 14px', marginBottom: 12, fontSize: '.76rem', color: 'var(--red)' }}>
+          {revisar} pago(s) para revisar: diferencia mayor a $50 contra Rendiciones o posible pago duplicado. Buscá el lote físico y estudiá la minuta.
+        </div>
+      )}
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10, flexWrap: 'wrap' }}>
+        {[['pendientes', `Necesitan acción (${necesitan.length})`], ['todos', `Todos (${mov.length})`]].map(([k, label]) => (
+          <button key={k} onClick={() => setFiltro(k)} style={btnMini(filtro === k)}>{label}</button>
+        ))}
+        <span style={{ fontSize: '.7rem', color: 'var(--txt3)' }}>Lote en verde = asignado desde Rendiciones · azul = cargado a mano</span>
+      </div>
+
+      <TableBox>
+        <thead><tr>
+          {['Estado', 'Fecha', 'Nro pago', 'Total', 'Motivo pago', 'Minuta', 'Lote', 'Rendido CRM', 'Diferencia'].map((h, i) => <th key={h} style={{ ...th, textAlign: i === 3 || i >= 7 ? 'right' : 'left' }}>{h}</th>)}
+        </tr></thead>
+        <tbody>
+          {filas.map(({ r, i }) => {
+            const e = ESTADO_FILA[r.estadoFila]
+            const manualLote = r.loteManual && String(r.loteManual).trim() !== ''
+            return (
+              <tr key={i}>
+                <td style={td}><span title={r.alerta} style={{ ...pill(e.bg, e.c), cursor: r.alerta ? 'help' : 'default', whiteSpace: 'nowrap' }}>{e.txt}</span></td>
+                <td style={{ ...td, whiteSpace: 'nowrap' }}>{formatDate(r.fecha)}</td>
+                <td style={td}>{r.nroPago}</td>
+                <td style={{ ...td, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{formatMonto(r.total)}</td>
+                <td style={{ ...td, maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={r.motivoPago}>{r.motivoPago}</td>
+                <td style={td}>
+                  <input value={r.minuta} maxLength={6} inputMode="numeric" placeholder="6 dígitos"
+                    onChange={e => onEdit(i, { minuta: e.target.value.replace(/\D/g, ''), minutaEstado: 'editada' })}
+                    onBlur={() => onPersist(r)}
+                    style={{ ...inputBase, background: r.minuta ? '#111' : 'var(--amber-dim)', border: `1px solid ${r.minuta ? 'var(--bdr2)' : 'var(--amber)'}` }} />
+                  {!r.minuta && r.minutaCandidatos && r.minutaCandidatos.length > 1 && (
+                    <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginTop: 4, maxWidth: 160 }}>
+                      {r.minutaCandidatos.slice(0, 6).map(c => (
+                        <button key={c} onClick={() => { onEdit(i, { minuta: c, minutaEstado: 'editada' }) }} style={{ ...btnMini(false), padding: '1px 6px' }}>{c}</button>
+                      ))}
+                    </div>
+                  )}
+                </td>
+                <td style={td}>
+                  <input value={r.lote} placeholder="Lote"
+                    onChange={e => onEdit(i, { loteManual: e.target.value })}
+                    onBlur={() => onPersist(r)}
+                    style={{ ...inputBase, background: r.lote ? (manualLote ? 'var(--blue-dim)' : 'var(--green-dim)') : '#111', border: `1px solid ${r.lote ? (manualLote ? 'var(--blue)' : 'var(--green)') : 'var(--amber)'}` }} />
+                </td>
+                <td style={{ ...td, textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: r.rendido === null ? 'var(--txt3)' : 'inherit' }}>
+                  {r.rendido === null ? '—' : formatMonto(r.rendido)}
+                  {r.pagoMultiple && <span title="Esta minuta se pagó en más de una vez: la diferencia está calculada sobre la suma de sus pagos" style={{ color: 'var(--txt2)', marginLeft: 4, cursor: 'help' }}>Σ</span>}
+                </td>
+                <td style={{ ...td, textAlign: 'right', fontWeight: 600, color: r.diferencia === null ? 'var(--txt3)' : Math.abs(r.diferencia) > 50 ? 'var(--red)' : Math.abs(r.diferencia) > 0.01 ? 'var(--amber)' : 'var(--green)' }}>
+                  {r.diferencia === null ? '—' : (Math.abs(r.diferencia) < 0.01 ? '0,00' : formatMonto(r.diferencia))}
+                </td>
+              </tr>
+            )
+          })}
+          {!filas.length && (
+            <tr><td colSpan={9} style={{ ...td, textAlign: 'center', color: 'var(--txt2)', padding: 28 }}>✅ No hay pagos que necesiten acción</td></tr>
+          )}
+        </tbody>
+      </TableBox>
     </>
   )
 }
