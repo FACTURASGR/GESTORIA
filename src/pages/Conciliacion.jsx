@@ -1,10 +1,10 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import * as XLSX from 'xlsx'
 import { supabase } from '../lib/supabase'
 import {
   detectFileType, parseMayor, parseMov, parseOperaciones, parseRendiciones, buildMatchesConLotes,
-  formatDate, formatMonto,
+  formatDate, formatMonto, parseDate,
 } from '../lib/conciliacion'
 
 const EMPRESAS = ['MOVILIS', 'KIARA', 'CIARA', 'PEARA', 'INV4', 'SALRA']
@@ -35,6 +35,339 @@ const btnOutline = {
   padding: '9px 20px', fontSize: '.82rem', fontWeight: 500, cursor: 'pointer',
 }
 
+// ── DEFINICIÓN DE LOS 4 ARCHIVOS ────────────────────────
+const SLOT_DEFS = [
+  { slot: 0, tipo: 'mayor',       grupo: 'empresa', icon: '📊', label: 'Mayor Autodealer (K1)',    hint: 'K1 → Finanzas → Resumen de Cuenta → Export Excel 5.0' },
+  { slot: 1, tipo: 'mov',         grupo: 'empresa', icon: '💳', label: 'Movimientos de Cuenta TH', hint: 'Web TH → Movimientos de Cuenta → Exportar' },
+  { slot: 2, tipo: 'operaciones', grupo: 'empresa', icon: '📋', label: 'Operaciones de Pago TH',   hint: 'Web TH → Operaciones de Pago → Exportar' },
+  { slot: 3, tipo: 'rendiciones', grupo: 'periodo', icon: '🗂️', label: 'Rendiciones CRM',          hint: 'CRM → Rendiciones → Reporte del período (todas las empresas)' },
+]
+const TIPO_A_SLOT = { mayor: 0, mov: 1, operaciones: 2, rendiciones: 3 }
+
+// Reconoce qué reporte es por sus columnas (rendiciones primero, el resto lo resuelve la librería)
+export function detectTipo(wb) {
+  try {
+    const ws = wb.Sheets[wb.SheetNames[0]]
+    const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' })
+    for (let i = 0; i < Math.min(15, rows.length); i++) {
+      const s = (rows[i] || []).join('|').toLowerCase()
+      if (s.includes('lote rendicion') || s.includes('num_minuta')) return 'rendiciones'
+    }
+  } catch (e) { /* si falla, deja que decida la librería */ }
+  return detectFileType(wb)
+}
+
+// Lee TODAS las filas del reporte de Rendiciones (sin filtrar por empresa), solo para previsualizar
+function leerRendiciones(wb) {
+  const ws  = wb.Sheets[wb.SheetNames[0]]
+  const raw = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null })
+  let h = 0
+  for (let i = 0; i < Math.min(5, raw.length); i++) {
+    const s = (raw[i] || []).join('|').toUpperCase()
+    if (s.includes('NUM_MINUTA') || s.includes('LOTE')) { h = i; break }
+  }
+  const hdr = (raw[h] || []).map(x => String(x || '').trim().toUpperCase())
+  const iS = hdr.findIndex(x => x.includes('SISTEMA'))
+  const iM = hdr.findIndex(x => x.includes('NUM_MINUTA') || x.includes('MINUTA'))
+  const iL = hdr.findIndex(x => x.includes('LOTE'))
+  const iR = hdr.findIndex(x => x.includes('REAL') || x.includes('RENDIDO'))
+  const out = []
+  for (let i = h + 1; i < raw.length; i++) {
+    const r = raw[i]
+    if (!r || !r[iM]) continue
+    out.push({
+      sistema: String(r[iS] || '').toUpperCase().trim(),
+      minuta:  String(r[iM]).trim(),
+      lote:    String(r[iL] || '').trim(),
+      monto:   parseFloat(r[iR]) || 0,
+    })
+  }
+  return out
+}
+
+function rangoFechas(valores) {
+  let min = null, max = null
+  for (const v of valores) {
+    const d = parseDate(v)
+    if (!d) continue
+    if (min === null || d < min) min = d
+    if (max === null || d > max) max = d
+  }
+  return min ? `${formatDate(min)} → ${formatDate(max)}` : '—'
+}
+const sumar = (arr, f) => arr.reduce((s, x) => s + (f(x) || 0), 0)
+
+// Arma lo que se muestra al previsualizar un archivo: tarjetas de resumen, avisos y tabla completa
+export function buildPreview(slot, wb, ctx = {}) {
+  const avisos = []
+  const emp = (ctx.empresa || '').toUpperCase()
+
+  if (slot === 0) {
+    const items = parseMayor(wb)
+    const op = items.filter(i => i.tipo === 'OP'), rm = items.filter(i => i.tipo === 'RM')
+    if (!items.length) avisos.push({ tone: 'bad', text: 'No encontré movimientos OP ni RM. ¿Es el Mayor correcto?' })
+    const sinRef = rm.filter(i => !i.referencia).length
+    if (sinRef) avisos.push({ tone: 'warn', text: `${sinRef} línea(s) RM sin número después de "TARJETA HABITUALISTA N".` })
+    avisos.push({ tone: 'info', text: 'Las líneas RC (recibos) se ignoran: no se concilian.' })
+    return {
+      resumen: `${items.length} movimientos · ${rangoFechas(items.map(i => i.fecha))}`,
+      stats: [
+        { label: 'OP (depósitos)', value: op.length, sub: '$ ' + formatMonto(sumar(op, i => i.monto)) },
+        { label: 'RM (pagos)',     value: rm.length, sub: '$ ' + formatMonto(sumar(rm, i => i.monto)) },
+        { label: 'Período',        value: rangoFechas(items.map(i => i.fecha)), small: true },
+      ],
+      columns: [
+        { k: 'tipo', label: 'Tipo' }, { k: 'fecha', label: 'Fecha', fmt: 'fecha' },
+        { k: 'descripcion', label: 'Comprobante' }, { k: 'referencia', label: 'Ref.' },
+        { k: 'monto', label: 'Monto', fmt: 'monto', right: true },
+      ],
+      rows: items, avisos,
+    }
+  }
+
+  if (slot === 1) {
+    const items = parseMov(wb)
+    const cr = items.filter(i => i.tipo === 'CREDIT'), db = items.filter(i => i.tipo === 'DEBIT')
+    if (!items.length) avisos.push({ tone: 'bad', text: 'No encontré movimientos CREDIT ni DEBIT. ¿Es el reporte correcto?' })
+    avisos.push({ tone: 'info', text: 'Se omiten los movimientos de monto 0 (por ejemplo comisiones bonificadas).' })
+    return {
+      resumen: `${items.length} movimientos · ${rangoFechas(items.map(i => i.fecha))}`,
+      stats: [
+        { label: 'CREDIT (ingresos)', value: cr.length, sub: '$ ' + formatMonto(sumar(cr, i => i.monto)) },
+        { label: 'DEBIT (pagos)',     value: db.length, sub: '$ ' + formatMonto(sumar(db, i => i.monto)) },
+        { label: 'Período',           value: rangoFechas(items.map(i => i.fecha)), small: true },
+      ],
+      columns: [
+        { k: 'fecha', label: 'Fecha', fmt: 'fecha' }, { k: 'tipo', label: 'Tipo' },
+        { k: 'descripcion', label: 'Descripción' }, { k: 'pagoNum', label: 'Pago N°' },
+        { k: 'monto', label: 'Monto', fmt: 'monto', right: true },
+      ],
+      rows: items, avisos,
+    }
+  }
+
+  if (slot === 2) {
+    const items = Object.values(parseOperaciones(wb))
+    const con = items.filter(o => o.minuta), sin = items.filter(o => !o.minuta)
+    const epagos = sin.filter(o => /epagos/i.test(o.motivoPago)).length
+    if (!items.length) avisos.push({ tone: 'bad', text: 'No encontré operaciones de pago. ¿Es el reporte correcto?' })
+    if (sin.length) avisos.push({ tone: 'warn', text: `${sin.length} pago(s) sin número de minuta reconocible en "Motivo pago"` + (epagos ? ` (${epagos} son AUTORIZACION EPAGOS; ${sin.length - epagos} con texto libre sin número: habrá que asignarles el lote a mano).` : '.') })
+    if (ctx.rendSet && ctx.opsMinutas) {
+      const unicas = [...new Set(ctx.opsMinutas)]
+      const hay = unicas.filter(m => ctx.rendSet.has(m)).length
+      avisos.push({
+        tone: unicas.length && hay / unicas.length < 0.5 ? 'warn' : 'ok',
+        text: `Cruce con Rendiciones: ${hay} de ${unicas.length} minutas de estos pagos aparecen en el reporte de Rendiciones${emp ? ' (' + emp + ')' : ''}.` +
+              (unicas.length && hay / unicas.length < 0.5 ? ' Si es poco, revisá que el reporte de Rendiciones cubra las fechas de rendición de estos pagos y que la empresa elegida sea la correcta.' : ''),
+      })
+    }
+    return {
+      resumen: `${items.length} pagos · ${con.length} con minuta`,
+      stats: [
+        { label: 'Pagos',        value: items.length, sub: '$ ' + formatMonto(sumar(items, o => o.total)) },
+        { label: 'Con minuta',   value: con.length,   tone: 'ok' },
+        { label: 'Sin minuta',   value: sin.length,   tone: sin.length ? 'warn' : 'ok' },
+        { label: 'Período',      value: rangoFechas(items.map(o => o.fecha)), small: true },
+      ],
+      columns: [
+        { k: 'nroPago', label: 'Nro pago' }, { k: 'fecha', label: 'Fecha', fmt: 'fecha' },
+        { k: 'total', label: 'Total', fmt: 'monto', right: true }, { k: 'seccRPA', label: 'Seccional' },
+        { k: 'tarjetahabiente', label: 'Tarjetahabiente' }, { k: 'minuta', label: 'Minuta' },
+        { k: 'motivoPago', label: 'Motivo pago' },
+      ],
+      rows: items, avisos,
+    }
+  }
+
+  // slot 3 — Rendiciones CRM
+  const todas = leerRendiciones(wb)
+  const filas = emp ? todas.filter(r => r.sistema === emp) : todas
+  const empresas = [...new Set(todas.map(r => r.sistema))].sort()
+  const lotes = new Set(filas.map(r => r.lote))
+  const nums = filas.map(r => Number(r.minuta)).filter(n => !isNaN(n))
+  if (!todas.length) avisos.push({ tone: 'bad', text: 'No encontré minutas. ¿Es el reporte de Rendiciones del CRM?' })
+  if (!emp) avisos.push({ tone: 'info', text: 'Elegí la empresa arriba para ver y usar solo sus minutas.' })
+  if (emp && todas.length && !filas.length) avisos.push({ tone: 'bad', text: `Este archivo no trae minutas de ${emp}. Trae: ${empresas.join(', ')}.` })
+  if (ctx.opsMinutas) {
+    const unicas = [...new Set(ctx.opsMinutas)]
+    const set = new Set(filas.map(r => r.minuta))
+    const hay = unicas.filter(m => set.has(m)).length
+    avisos.push({
+      tone: unicas.length && hay / unicas.length < 0.5 ? 'warn' : 'ok',
+      text: `Cruce con Operaciones: ${hay} de ${unicas.length} minutas de los pagos cargados están en este reporte.`,
+    })
+  }
+  return {
+    resumen: `${filas.length} minutas · ${lotes.size} lotes` + (emp ? ` (${emp})` : ` · ${empresas.length} empresas`),
+    stats: [
+      { label: emp ? `Minutas ${emp}` : 'Minutas (todas)', value: filas.length, sub: '$ ' + formatMonto(sumar(filas, r => r.monto)) },
+      { label: 'Lotes de rendición', value: lotes.size },
+      { label: 'Empresas en el archivo', value: empresas.join(' · ') || '—', small: true },
+      { label: 'Rango de minutas', value: nums.length ? `${Math.min(...nums)} → ${Math.max(...nums)}` : '—', small: true },
+    ],
+    columns: [
+      { k: 'sistema', label: 'Empresa' }, { k: 'minuta', label: 'Minuta' },
+      { k: 'lote', label: 'Lote' }, { k: 'monto', label: 'Rendido', fmt: 'monto', right: true },
+    ],
+    rows: filas, avisos,
+  }
+}
+
+function safePreview(slot, wb, ctx) {
+  try { return buildPreview(slot, wb, ctx) }
+  catch (err) { return { error: err.message || 'No pude leer el archivo', resumen: '', stats: [], columns: [], rows: [], avisos: [] } }
+}
+
+const TONOS = {
+  ok:   { c: 'var(--green)', bg: 'var(--green-dim)',  b: 'rgba(181,204,46,.35)' },
+  warn: { c: 'var(--amber)', bg: 'var(--amber-dim)',  b: 'rgba(245,158,11,.35)' },
+  bad:  { c: 'var(--red)',   bg: 'var(--red-dim)',    b: 'rgba(229,57,53,.35)' },
+  info: { c: 'var(--txt2)',  bg: '#161616',           b: 'var(--bdr2)' },
+}
+
+function btnMini(activo, peligro) {
+  return {
+    background: activo ? 'var(--green)' : 'transparent',
+    color: activo ? '#000' : (peligro ? 'var(--red)' : 'var(--txt)'),
+    border: `1px solid ${activo ? 'var(--green)' : (peligro ? 'rgba(229,57,53,.5)' : 'var(--bdr2)')}`,
+    borderRadius: 6, padding: '5px 10px', fontSize: '.7rem', fontWeight: 600, cursor: 'pointer',
+  }
+}
+
+// Tarjeta de un archivo: zona para soltarlo si está vacío; si ya está cargado, resumen + ver/quitar
+function SlotCard({ def, fileName, loaded, resumen, error, activo, onFiles, onRemove, onView }) {
+  const [over, setOver] = useState(false)
+
+  if (loaded) {
+    return (
+      <div style={{ border: `1.5px solid ${activo ? 'var(--green)' : 'var(--bdr2)'}`, background: 'var(--green-dim)', borderRadius: 10, padding: '14px 16px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+          <span style={{ fontSize: '1.3rem' }}>{def.icon}</span>
+          <div style={{ fontSize: '.8rem', fontWeight: 700 }}>{def.label}</div>
+        </div>
+        <div title={fileName} style={{ fontSize: '.7rem', color: 'var(--green)', fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>✓ {fileName}</div>
+        <div style={{ fontSize: '.7rem', color: error ? 'var(--red)' : 'var(--txt2)', margin: '4px 0 10px' }}>{error || resumen}</div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button onClick={onView} style={btnMini(activo)}>{activo ? '▲ Ocultar' : '👁 Ver contenido'}</button>
+          <button onClick={onRemove} style={btnMini(false, true)}>✕ Quitar</button>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div
+      onDragOver={e => { e.preventDefault(); setOver(true) }}
+      onDragLeave={() => setOver(false)}
+      onDrop={e => { e.preventDefault(); setOver(false); onFiles([...e.dataTransfer.files]) }}
+      style={{
+        border: `1.5px dashed ${over ? 'var(--green)' : 'var(--bdr2)'}`,
+        background: over ? 'var(--green-dim)' : '#111',
+        borderRadius: 10, padding: '20px 16px', textAlign: 'center', cursor: 'pointer', position: 'relative',
+      }}
+    >
+      <input type="file" accept=".xlsx,.xls,.csv" multiple
+        style={{ position: 'absolute', inset: 0, opacity: 0, cursor: 'pointer', width: '100%', height: '100%' }}
+        onChange={e => { onFiles([...e.target.files]); e.target.value = '' }} />
+      <div style={{ fontSize: '1.5rem', marginBottom: 7 }}>{def.icon}</div>
+      <div style={{ fontSize: '.8rem', fontWeight: 700, marginBottom: 4 }}>{def.label}</div>
+      <div style={{ fontSize: '.67rem', color: 'var(--txt3)', marginBottom: 8 }}>{def.hint}</div>
+      <div style={{ fontSize: '.7rem', color: 'var(--txt2)' }}>Arrastrá o hacé click</div>
+    </div>
+  )
+}
+
+// Panel con todo lo que contiene el archivo: resumen, avisos y tabla (con buscador)
+function PreviewPanel({ def, fileName, preview, onClose, onRemove }) {
+  const LIMITE = 200
+  const [filtro, setFiltro] = useState('')
+  const [verTodo, setVerTodo] = useState(false)
+
+  const coincidentes = useMemo(() => {
+    const q = filtro.trim().toLowerCase()
+    if (!q) return preview.rows
+    return preview.rows.filter(r => preview.columns.some(c => String(r[c.k] ?? '').toLowerCase().includes(q)))
+  }, [preview, filtro])
+  const visibles = verTodo ? coincidentes : coincidentes.slice(0, LIMITE)
+
+  const celda = (c, v) => c.fmt === 'fecha' ? formatDate(v) : c.fmt === 'monto' ? formatMonto(v) : (v == null ? '' : String(v))
+
+  return (
+    <div style={{ border: '1px solid var(--green)', borderRadius: 10, background: '#0e0e0e', padding: '16px 18px', marginBottom: 20 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 14, flexWrap: 'wrap' }}>
+        <div>
+          <div style={{ fontSize: '.85rem', fontWeight: 700 }}>{def.icon} Previsualización · {def.label}</div>
+          <div style={{ fontSize: '.7rem', color: 'var(--txt2)' }}>{fileName}</div>
+        </div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button onClick={onRemove} style={btnMini(false, true)}>✕ Quitar archivo</button>
+          <button onClick={onClose} style={btnMini(false)}>Cerrar</button>
+        </div>
+      </div>
+
+      {preview.error ? (
+        <div style={{ background: TONOS.bad.bg, border: `1px solid ${TONOS.bad.b}`, color: TONOS.bad.c, borderRadius: 8, padding: '12px 14px', fontSize: '.78rem' }}>
+          No pude interpretar este archivo: {preview.error}
+        </div>
+      ) : (
+        <>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 10, marginBottom: 12 }}>
+            {preview.stats.map(s => (
+              <div key={s.label} style={{ background: 'var(--surf)', border: '1px solid var(--bdr)', borderLeft: `3px solid ${(TONOS[s.tone] || TONOS.ok).c}`, borderRadius: 8, padding: '10px 12px' }}>
+                <div style={{ fontSize: '.62rem', color: 'var(--txt2)', textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 4 }}>{s.label}</div>
+                <div style={{ fontSize: s.small ? '.78rem' : '1.2rem', fontWeight: 800, lineHeight: 1.3 }}>{s.value}</div>
+                {s.sub && <div style={{ fontSize: '.68rem', color: 'var(--txt2)', marginTop: 2 }}>{s.sub}</div>}
+              </div>
+            ))}
+          </div>
+
+          {preview.avisos.map((a, i) => (
+            <div key={i} style={{ background: TONOS[a.tone].bg, border: `1px solid ${TONOS[a.tone].b}`, color: TONOS[a.tone].c, borderRadius: 8, padding: '8px 12px', fontSize: '.74rem', marginBottom: 8 }}>
+              {a.text}
+            </div>
+          ))}
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, margin: '12px 0 8px', flexWrap: 'wrap' }}>
+            <input
+              value={filtro} onChange={e => { setFiltro(e.target.value); setVerTodo(false) }}
+              placeholder="Buscar en el archivo (minuta, monto, texto…)"
+              style={{ flex: '1 1 260px', background: '#111', border: '1px solid var(--bdr2)', color: '#fff', borderRadius: 7, padding: '8px 10px', fontSize: '.78rem', outline: 'none' }}
+            />
+            <span style={{ fontSize: '.72rem', color: 'var(--txt2)' }}>
+              Mostrando {visibles.length} de {coincidentes.length}{filtro ? ` (${preview.rows.length} en total)` : ''}
+            </span>
+            {!verTodo && coincidentes.length > LIMITE && (
+              <button onClick={() => setVerTodo(true)} style={btnMini(false)}>Mostrar las {coincidentes.length}</button>
+            )}
+          </div>
+
+          <div style={{ maxHeight: 360, overflow: 'auto', border: '1px solid var(--bdr)', borderRadius: 8, background: 'var(--surf)' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+              <thead>
+                <tr>{preview.columns.map(c => <th key={c.k} style={{ ...th, position: 'sticky', top: 0, textAlign: c.right ? 'right' : 'left' }}>{c.label}</th>)}</tr>
+              </thead>
+              <tbody>
+                {visibles.map((r, i) => (
+                  <tr key={i}>
+                    {preview.columns.map(c => (
+                      <td key={c.k} style={{ ...td, textAlign: c.right ? 'right' : 'left', fontVariantNumeric: c.right ? 'tabular-nums' : 'normal', maxWidth: 380, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={celda(c, r[c.k])}>
+                        {celda(c, r[c.k])}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+                {!visibles.length && (
+                  <tr><td colSpan={preview.columns.length} style={{ ...td, textAlign: 'center', color: 'var(--txt2)', padding: 24 }}>Sin filas para mostrar</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
 export default function Conciliacion() {
   const { id } = useParams()
   const navigate = useNavigate()
@@ -49,6 +382,8 @@ export default function Conciliacion() {
   const [processing,   setProcessing]   = useState(false)
   const [saving,       setSaving]       = useState(false)
   const [activeTab,    setActiveTab]    = useState(0)
+  const [previewSlot,  setPreviewSlot]  = useState(null)
+  const [notice,        setNotice]       = useState(null)
 
   useEffect(() => { if (id) loadFromSupabase(id) }, [id])
 
@@ -77,13 +412,48 @@ export default function Conciliacion() {
   }
 
   async function readFile(file, hint) {
-    const buf = await file.arrayBuffer()
-    const wb  = XLSX.read(buf, { type: 'array', cellDates: true })
-    const tipo = detectFileType(wb)
-    const slot = tipo === 'mayor' ? 0 : tipo === 'mov' ? 1 : tipo === 'operaciones' ? 2 : hint
-    setWorkbooks(prev => { const n = [...prev]; n[slot] = wb; return n })
-    setFileNames(prev => { const n = [...prev]; n[slot] = file.name; return n })
+    try {
+      const buf  = await file.arrayBuffer()
+      const wb   = XLSX.read(buf, { type: 'array', cellDates: true })
+      const tipo = detectTipo(wb)
+      let slot = TIPO_A_SLOT[tipo]
+      let aviso = null
+      if (slot === undefined) {
+        slot = hint
+        aviso = { kind: 'warn', text: `No pude identificar el formato de «${file.name}». Lo cargué como ${SLOT_DEFS[slot].label}: revisá la previsualización.` }
+      } else if (slot !== hint) {
+        aviso = { kind: 'info', text: `«${file.name}» es ${SLOT_DEFS[slot].label}: lo cargué en su lugar.` }
+      }
+      setWorkbooks(prev => { const n = [...prev]; n[slot] = wb; return n })
+      setFileNames(prev => { const n = [...prev]; n[slot] = file.name; return n })
+      setPreviewSlot(slot)
+      setNotice(aviso)
+    } catch (err) {
+      setNotice({ kind: 'error', text: `No pude leer «${file.name}»: ${err.message}` })
+    }
   }
+
+  function readFiles(files, hint) { files.forEach(f => readFile(f, hint)) }
+
+  function removeFile(slot) {
+    setWorkbooks(prev => prev.map((w, i) => i === slot ? null : w))
+    setFileNames(prev => prev.map((n, i) => i === slot ? '' : n))
+    setPreviewSlot(p => p === slot ? null : p)
+    setNotice(null)
+  }
+
+  // Previsualización de cada archivo cargado (se recalcula si cambia un archivo o la empresa)
+  const previews = useMemo(() => {
+    const emp = (empresa || '').toUpperCase()
+    let rendSet = null, opsMinutas = null
+    if (workbooks[3]) {
+      try { rendSet = new Set(leerRendiciones(workbooks[3]).filter(r => !emp || r.sistema === emp).map(r => r.minuta)) } catch (e) { /* se informa en su propia previsualización */ }
+    }
+    if (workbooks[2]) {
+      try { opsMinutas = Object.values(parseOperaciones(workbooks[2])).map(o => o.minuta).filter(Boolean) } catch (e) { /* idem */ }
+    }
+    return [0, 1, 2, 3].map(s => workbooks[s] ? safePreview(s, workbooks[s], { empresa, rendSet, opsMinutas }) : null)
+  }, [workbooks, empresa])
 
   async function procesar() {
     setProcessing(true)
@@ -374,39 +744,28 @@ export default function Conciliacion() {
             ))}
           </div>
 
+          {/* AVISO (archivo reubicado / no reconocido / error) */}
+          {notice && (
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, background: TONOS[notice.kind === 'error' ? 'bad' : notice.kind === 'warn' ? 'warn' : 'info'].bg, border: `1px solid ${TONOS[notice.kind === 'error' ? 'bad' : notice.kind === 'warn' ? 'warn' : 'info'].b}`, color: TONOS[notice.kind === 'error' ? 'bad' : notice.kind === 'warn' ? 'warn' : 'info'].c, borderRadius: 8, padding: '9px 12px', fontSize: '.76rem', marginBottom: 14 }}>
+              <span>{notice.text}</span>
+              <button onClick={() => setNotice(null)} style={{ background: 'none', border: 'none', color: 'inherit', cursor: 'pointer', fontSize: '.9rem' }}>✕</button>
+            </div>
+          )}
+
           {/* ARCHIVOS POR EMPRESA */}
           <div style={{ fontSize: '.7rem', fontWeight: 700, color: 'var(--txt2)', textTransform: 'uppercase', letterSpacing: '.07em', marginBottom: 10, display: 'flex', alignItems: 'center', gap: 8 }}>
             <span style={{ background: 'var(--green)', color: '#000', borderRadius: 4, padding: '1px 7px', fontSize: '.65rem' }}>1 por empresa</span>
             Se descargan individualmente para la empresa seleccionada
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 12, marginBottom: 20 }}>
-            {[
-              { label: 'Mayor Autodealer (K1)', icon: '📊', slot: 0, hint: 'K1 → Finanzas → Resumen de Cuenta → Export Excel 5.0' },
-              { label: 'Movimientos de Cuenta TH', icon: '💳', slot: 1, hint: 'Web TH → Movimientos de Cuenta → Exportar' },
-              { label: 'Operaciones de Pago TH', icon: '📋', slot: 2, hint: 'Web TH → Operaciones de Pago → Exportar' },
-            ].map(({ label, icon, slot, hint }) => (
-              <div
-                key={slot}
-                onDragOver={e => e.preventDefault()}
-                onDrop={e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) readFile(f, slot) }}
-                style={{
-                  border: `1.5px dashed ${workbooks[slot] ? 'var(--green)' : 'var(--bdr2)'}`,
-                  background: workbooks[slot] ? 'var(--green-dim)' : '#111',
-                  borderRadius: 10, padding: '20px 16px', textAlign: 'center',
-                  cursor: 'pointer', position: 'relative',
-                }}
-              >
-                <input type="file" accept=".xlsx,.xls"
-                  style={{ position: 'absolute', inset: 0, opacity: 0, cursor: 'pointer', width: '100%', height: '100%' }}
-                  onChange={e => e.target.files[0] && readFile(e.target.files[0], slot)} />
-                <div style={{ fontSize: '1.5rem', marginBottom: 7 }}>{icon}</div>
-                <div style={{ fontSize: '.8rem', fontWeight: 700, marginBottom: 4 }}>{label}</div>
-                <div style={{ fontSize: '.67rem', color: 'var(--txt3)', marginBottom: 8 }}>{hint}</div>
-                {workbooks[slot]
-                  ? <div style={{ fontSize: '.7rem', color: 'var(--green)', fontWeight: 600 }}>✓ {fileNames[slot]}</div>
-                  : <div style={{ fontSize: '.7rem', color: 'var(--txt2)' }}>Arrastrá o hacé click</div>
-                }
-              </div>
+            {SLOT_DEFS.filter(d => d.grupo === 'empresa').map(def => (
+              <SlotCard key={def.slot} def={def}
+                fileName={fileNames[def.slot]} loaded={!!workbooks[def.slot]}
+                resumen={previews[def.slot]?.resumen} error={previews[def.slot]?.error}
+                activo={previewSlot === def.slot}
+                onFiles={files => readFiles(files, def.slot)}
+                onRemove={() => removeFile(def.slot)}
+                onView={() => setPreviewSlot(previewSlot === def.slot ? null : def.slot)} />
             ))}
           </div>
 
@@ -415,36 +774,33 @@ export default function Conciliacion() {
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
               <span style={{ background: '#1A73E8', color: '#fff', borderRadius: 4, padding: '1px 7px', fontSize: '.65rem', fontWeight: 700 }}>Todo el período</span>
               <div>
-                <div style={{ fontSize: '.78rem', fontWeight: 700 }}>Rendiciones CRM</div>
-                <div style={{ fontSize: '.68rem', color: 'var(--txt2)' }}>Un solo archivo · Incluye todas las empresas · CRM → Rendiciones → Reporte del período</div>
+                <div style={{ fontSize: '.78rem', fontWeight: 700 }}>Rendiciones CRM <span style={{ color: 'var(--txt3)', fontWeight: 500 }}>· opcional</span></div>
+                <div style={{ fontSize: '.68rem', color: 'var(--txt2)' }}>Un solo archivo con todas las empresas. Si no lo subís, los lotes se cargan a mano.</div>
               </div>
             </div>
-            <div
-              onDragOver={e => e.preventDefault()}
-              onDrop={e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) readFile(f, 3) }}
-              style={{
-                border: `1.5px dashed ${workbooks[3] ? 'var(--green)' : '#333'}`,
-                background: workbooks[3] ? 'var(--green-dim)' : '#111',
-                borderRadius: 8, padding: '16px', textAlign: 'center',
-                cursor: 'pointer', position: 'relative',
-              }}
-            >
-              <input type="file" accept=".xlsx,.xls,.csv"
-                style={{ position: 'absolute', inset: 0, opacity: 0, cursor: 'pointer', width: '100%', height: '100%' }}
-                onChange={e => e.target.files[0] && readFile(e.target.files[0], 3)} />
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10 }}>
-                <span style={{ fontSize: '1.4rem' }}>🗂️</span>
-                <div style={{ textAlign: 'left' }}>
-                  {workbooks[3]
-                    ? <div style={{ fontSize: '.78rem', color: 'var(--green)', fontWeight: 700 }}>✓ {fileNames[3]} — Lotes asignados automáticamente</div>
-                    : <>
-                        <div style={{ fontSize: '.78rem', fontWeight: 600 }}>Arrastrá el archivo o hacé click para subir</div>
-                        <div style={{ fontSize: '.68rem', color: 'var(--txt2)', marginTop: 2 }}>Opcional · Si no lo subís, podés asignar los lotes a mano</div>
-                      </>
-                  }
-                </div>
-              </div>
-            </div>
+            <SlotCard def={SLOT_DEFS[3]}
+              fileName={fileNames[3]} loaded={!!workbooks[3]}
+              resumen={previews[3]?.resumen} error={previews[3]?.error}
+              activo={previewSlot === 3}
+              onFiles={files => readFiles(files, 3)}
+              onRemove={() => removeFile(3)}
+              onView={() => setPreviewSlot(previewSlot === 3 ? null : 3)} />
+          </div>
+
+          {/* PREVISUALIZACIÓN DEL ARCHIVO SELECCIONADO */}
+          {previewSlot !== null && workbooks[previewSlot] && previews[previewSlot] && (
+            <PreviewPanel key={previewSlot + '|' + fileNames[previewSlot]}
+              def={SLOT_DEFS[previewSlot]} fileName={fileNames[previewSlot]} preview={previews[previewSlot]}
+              onClose={() => setPreviewSlot(null)} onRemove={() => removeFile(previewSlot)} />
+          )}
+
+          {/* CHECKLIST */}
+          <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: '.72rem', margin: '0 0 14px' }}>
+            {SLOT_DEFS.map(d => (
+              <span key={d.slot} style={{ color: workbooks[d.slot] ? 'var(--green)' : 'var(--txt3)', fontWeight: workbooks[d.slot] ? 600 : 400 }}>
+                {workbooks[d.slot] ? '✓' : '○'} {d.label}{d.slot === 3 ? ' (opcional)' : ''}
+              </span>
+            ))}
           </div>
 
           <button
@@ -474,6 +830,8 @@ export default function Conciliacion() {
           onGuardar={guardar}
           onExport={exportExcel}
           onNueva={() => { setResults(null); setWorkbooks([null,null,null,null]); setFileNames(['','','','']); setConcilId(null); navigate('/nueva') }}
+          onEditar={() => setResults(null)}
+          puedeEditar={!!(workbooks[0] && workbooks[1] && workbooks[2])}
           onUpdateLote={updateLote}
         />
       )}
@@ -481,7 +839,7 @@ export default function Conciliacion() {
   )
 }
 
-function ResultsSection({ results, empresa, concilId, saving, activeTab, setActiveTab, onGuardar, onExport, onNueva, onUpdateLote }) {
+function ResultsSection({ results, empresa, concilId, saving, activeTab, setActiveTab, onGuardar, onExport, onNueva, onUpdateLote, onEditar, puedeEditar }) {
   const { depositos, pagos, pendMayor, pendCredits, pendDebits } = results
   const totDep   = depositos.reduce((s, r) => s + r.mayor.monto, 0)
   const totPag   = pagos.reduce((s, r) => s + r.mayor.monto, 0)
@@ -511,6 +869,7 @@ function ResultsSection({ results, empresa, concilId, saving, activeTab, setActi
           {saving ? '⏳ Guardando…' : concilId ? '💾 Actualizar' : '💾 Guardar'}
         </button>
         <button onClick={onExport} style={btnOutline}>⬇ Descargar Excel</button>
+        {puedeEditar && <button onClick={onEditar} style={btnOutline}>✎ Editar archivos</button>}
         <button onClick={onNueva} style={btnOutline}>↺ Nueva</button>
         {concilId && <span style={{ fontSize: '.72rem', color: 'var(--txt2)' }}>Los lotes se guardan automáticamente</span>}
       </div>
@@ -600,7 +959,7 @@ function ResultsSection({ results, empresa, concilId, saving, activeTab, setActi
                   <td style={td}>{formatDate(r.mayor.fecha)}</td>
                   <td style={td}>{r.mayor.referencia}</td>
                   <td style={{ ...td, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{formatMonto(r.mayor.monto)}</td>
-                  <td style={td}><strong style={{ color: 'var(--green)' }}>{r.op?.minuta || '—'}</strong></td>
+                  <td style={td}><strong style={{ color: 'var(--green)' }}>{r.op?.minuta || '—'}</strong>{r.opAmbiguo && <span title="Había más de un pago posible (mismo monto, seccional y fecha) con minutas distintas: confirmá esta minuta" style={{ color: 'var(--amber)', marginLeft: 6, cursor: 'help' }}>⚠</span>}</td>
                   <td style={{ ...td, fontSize: '.7rem', color: 'var(--txt2)' }}>{r.op?.seccRPA || ''}</td>
                   <td style={{ ...td, fontSize: '.7rem', whiteSpace: 'nowrap', color: 'var(--txt2)' }}>{r.op?.tarjetahabiente || ''}</td>
                   <td style={td}>{formatDate(r.th.fecha)}</td>
