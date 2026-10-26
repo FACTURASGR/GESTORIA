@@ -170,6 +170,23 @@ export function parseMov(wb) {
 
 // ── PARSER: OPERACIONES DE PAGO TH ────────────────────────
 
+// Extrae el numero de minuta del campo "Motivo pago". Las gestoras lo escriben de varias formas:
+//   "Minuta: 406648 Tramite..."  |  "Minuta 406574 ..."  |  "Bravo - min 406703"  |  "405156 0km distribuidora"
+// Si no hay un numero identificable devuelve '' (por ej. "AUTORIZACION EPAGOS - Seccional: 99997").
+export function extraerMinuta(motivo) {
+  const t = String(motivo || '')
+  // 1) con la palabra: "Minuta: 406648", "Minuta 406574", "min 406703", "MIN. 407052"
+  let m = t.match(/\bmin(?:uta)?\.?\s*:?\s*#?\s*(\d{5,7})(?!\d)/i)
+  if (m) return m[1]
+  // 2) numero al principio del texto: "405156 0km distribuidora"
+  m = t.match(/^\s*#?(\d{5,7})(?!\d)/)
+  if (m) return m[1]
+  // 3) un unico numero de 6 digitos suelto en cualquier parte: "okm lopez 408937"
+  const sueltos = t.match(/(?<![A-Za-z0-9])\d{6}(?![A-Za-z0-9])/g)
+  if (sueltos && sueltos.length === 1) return sueltos[0]
+  return ''
+}
+
 export function parseOperaciones(wb) {
   const rows = sheetToRows(wb)
   let headerIdx = 0
@@ -199,7 +216,7 @@ export function parseOperaciones(wb) {
     if (!nroPago) continue
 
     const motivo = String(row[iMot] || '')
-    const minutaMatch = motivo.match(/Minuta\s+(\d+)/i)
+    const minuta = extraerMinuta(motivo)
 
     lookup[nroPago] = {
       nroOp:          row[iOp],
@@ -211,7 +228,7 @@ export function parseOperaciones(wb) {
       tarjeta:        String(row[iTarj]  || ''),
       estado:         String(row[iEst]   || ''),
       motivoPago:     motivo,
-      minuta:         minutaMatch ? minutaMatch[1] : '',
+      minuta,
       observaciones:  String(row[iObs]   || ''),
     }
   }
@@ -219,6 +236,52 @@ export function parseOperaciones(wb) {
 }
 
 // ── ALGORITMO DE MATCHING ──────────────────────────────────
+
+// ── EMPAREJAR DEBIT (Movimientos) ↔ Operaciones de pago ────
+// El "Pago: N" de Movimientos NO es el mismo numero que "Nro de pago" de Operaciones
+// (difieren unos 31-33 de forma sistematica), asi que el cruce se hace por
+// monto + seccional + fecha. Si hay varios candidatos se desempata por cercania de numeracion.
+// Devuelve un Map: debit -> { op, ambiguo }  (ambiguo = habia candidatos con minutas distintas)
+export function emparejarOperaciones(debits, operaciones) {
+  const ops = Object.values(operaciones || {})
+  const secOps = o => (String(o.seccRPA || '').match(/^\s*(\d+)/) || [])[1] || ''
+  const secMov = d => (String(d.descripcion || '').match(/Seccional:\s*(\d+)/i) || [])[1] || ''
+  const mismoDia = (a, b) => { const x = parseDate(a), y = parseDate(b); return !!(x && y && x.toDateString() === y.toDateString()) }
+  const mismoMonto = (o, d) => Math.abs(o.total - d.monto) < 0.05
+
+  const candidatosDe = d => {
+    let c = ops.filter(o => mismoMonto(o, d) && secOps(o) === secMov(d) && mismoDia(o.fecha, d.fecha))
+    if (!c.length) c = ops.filter(o => mismoMonto(o, d) && secOps(o) === secMov(d))
+    return c
+  }
+
+  // desfase tipico entre ambas numeraciones, medido con los casos sin ambiguedad
+  const difs = []
+  for (const d of debits) {
+    const c = candidatosDe(d)
+    if (c.length === 1 && d.pagoNum) difs.push(d.pagoNum - c[0].nroPago)
+  }
+  difs.sort((a, b) => a - b)
+  const desfase = difs.length ? difs[Math.floor(difs.length / 2)] : null
+
+  const usados = new Set()
+  const resultado = new Map()
+  // los mas acotados primero (menos candidatos), asi los ambiguos eligen entre lo que sobra
+  const orden = debits.map(d => ({ d, n: candidatosDe(d).length })).sort((a, b) => a.n - b.n)
+  for (const { d } of orden) {
+    const libres = candidatosDe(d).filter(o => !usados.has(o.nroPago))
+    if (!libres.length) continue
+    const dist = o => d.pagoNum
+      ? Math.abs((d.pagoNum - o.nroPago) - (desfase ?? 0))
+      : 0
+    libres.sort((a, b) => dist(a) - dist(b))
+    const elegido = libres[0]
+    usados.add(elegido.nroPago)
+    const ambiguo = libres.length > 1 && new Set(libres.map(o => o.minuta)).size > 1
+    resultado.set(d, { op: elegido, ambiguo })
+  }
+  return resultado
+}
 
 export function buildMatches(mayorItems, movItems, operaciones, fechaBuffer = 10) {
   // Calcular rango de fechas TH para filtrar el Mayor
@@ -268,17 +331,22 @@ export function buildMatches(mayorItems, movItems, operaciones, fechaBuffer = 10
     }
   }
 
+  // Operaciones asociadas a cada DEBIT (por monto + seccional + fecha)
+  const opPorDebit = emparejarOperaciones(debits, operaciones)
+
   // RM → DEBIT → Operaciones
   for (const item of mayorFiltrado.filter(m => m.tipo === 'RM')) {
     const th = mejorMatch(debits, item.monto, item.fecha)
     if (th) {
       th._usado = true
-      const op = th.pagoNum ? operaciones[th.pagoNum] : null
+      const asociado = opPorDebit.get(th)
+      const op = asociado ? asociado.op : null
       const diferencia = parseFloat((item.monto - (op ? op.total : th.monto)).toFixed(2))
       pagos.push({
         mayor: item,
         th,
         op,
+        opAmbiguo: asociado ? asociado.ambiguo : false,
         diferencia,
         lote: '',
         estado: Math.abs(diferencia) > 50 ? 'revisar' : 'sin_lote',
