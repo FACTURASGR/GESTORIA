@@ -1,0 +1,38 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;900&display=swap');
+
+:root {
+  --bg:        #111111;
+  --sidebar:   #0D0D0D;
+  --surf:      #1A1A1A;
+  --surf2:     #222222;
+  --bdr:       #252525;
+  --bdr2:      #2E2E2E;
+  --txt:       #FFFFFF;
+  --txt2:      #888888;
+  --txt3:      #555555;
+  --green:     #B5CC2E;
+  --green-dim: rgba(181,204,46,0.12);
+  --green-dk:  #8fa020;
+  --red:       #E53935;
+  --red-dim:   rgba(229,57,53,0.12);
+  --amber:     #F59E0B;
+  --amber-dim: rgba(245,158,11,0.12);
+  --blue:      #3B82F6;
+  --blue-dim:  rgba(59,130,246,0.12);
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { font-size: 14px; }
+body {
+  font-family: 'Inter', system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--txt);
+  min-height: 100vh;
+}
+button { cursor: pointer; font-family: inherit; }
+input, select, textarea { font-family: inherit; }
+a { color: var(--green); text-decoration: none; }
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #444; }
